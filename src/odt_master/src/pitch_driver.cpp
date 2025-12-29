@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <stdexcept>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -23,6 +24,9 @@ static const char *CAN_IFACE = "can0";
 static const int ENCODER_RES = 65536;
 static const int MAX_RPM = 5000;
 
+static constexpr double ROLLER_DIAMETER_M = 0.10;  // <-- set this (meters, mm, whatever you're using consistently)
+static constexpr double CMD_REFRESH_HZ  = 50.0;  // <-- target update rate to drive (Hz)
+
 class KincoCanopenDriver{
 public:
   KincoCanopenDriver(ros::NodeHandle& nh){
@@ -30,25 +34,39 @@ public:
     openCanSocket(CAN_IFACE);
 
     pub_actual_vel_ = nh.advertise<std_msgs::Float64>("actual_velocity_rpm", 10);
-    sub_target_vel_ = nh.subscribe("target_velocity_rpm", 10, &KincoCanopenDriver::targetVelocityCb, this);
+    // sub_target_vel_ = nh.subscribe("target_velocity_rpm", 10, &KincoCanopenDriver::targetVelocityCb, this);
+    sub_vel_kf_ = nh.subscribe("imu/vel_kf", 20, &KincoCanopenDriver::velCb, this);
 
     ROS_INFO("Initializing Kinco servo via SDO...");
     initDrive();
 
     poll_period_ = 0.05;
-    timer_ = nh.createTimer(ros::Duration(poll_period_), &KincoCanopenDriver::pollActualVelocity, this);
+    poll_timer_ = nh.createTimer(ros::Duration(poll_period_), &KincoCanopenDriver::pollActualVelocity, this);
+
+    if (CMD_REFRESH_HZ <= 0.0){throw std::runtime_error("CMD_REFRESH_HZ must be > 0");}
+
+    cmd_period_ = 1.0 / CMD_REFRESH_HZ;
+    cmd_timer_ = nh.createTimer(ros::Duration(cmd_period_), &KincoCanopenDriver::sendTargetAtRate, this);
   }
 
   ~KincoCanopenDriver(){
     if (sock_ >= 0){close(sock_);}
-    }
+  }
 
 private:
   int sock_;
+
   ros::Publisher pub_actual_vel_;
-  ros::Subscriber sub_target_vel_;
-  ros::Timer timer_;
+  ros::Subscriber sub_vel_kf_;
+
+  ros::Timer poll_timer_;
+  ros::Timer cmd_timer_;
+
   double poll_period_;
+  double cmd_period_;
+
+  double latest_vel_kf_ = 0.0;
+  bool have_vel_ = false;
 
   void openCanSocket(const char *ifname){
     struct ifreq ifr;
@@ -67,6 +85,9 @@ private:
     addr.can_ifindex = ifr.ifr_ifindex;
 
     if (bind(sock_, (struct sockaddr *)&addr, sizeof(addr)) < 0){throw std::runtime_error("bind(AF_CAN) failed");}
+
+    latest_vel_kf_ = 0.0;
+    have_vel_ = false;
 
     ROS_INFO("SocketCAN bound to interface: %s", ifname);
   }
@@ -148,23 +169,26 @@ private:
     sendSdo(0x23, index, sub, b, 4);
   }
 
-  bool sdoReadI32(uint16_t index, uint8_t sub, int32_t *out_val, int window_ms){
-    uint32_t req_cob = 0x600 + NODE_ID;
+  bool sdoReadI32(uint16_t index, uint8_t sub, int32_t *out_val, int window_ms) {
     uint32_t rep_cob = 0x580 + NODE_ID;
-
-    (void)req_cob;
 
     sendSdo(0x40, index, sub, NULL, 0);
 
     ros::Time end = ros::Time::now() + ros::Duration(window_ms / 1000.0);
     while (ros::Time::now() < end && ros::ok()) {
       struct can_frame f;
-      if (!recvFrame(&f, 5))continue;
-      if ((f.can_id & CAN_EFF_MASK) != rep_cob)continue;
-      if (f.can_dlc < 8)continue;
-      if (f.data[1] != (uint8_t)(index & 0xFF))continue;
-      if (f.data[2] != (uint8_t)((index >> 8) & 0xFF))continue;
-      if (f.data[3] != sub) continue;
+      if (!recvFrame(&f, 5))
+        continue;
+      if ((f.can_id & CAN_EFF_MASK) != rep_cob)
+        continue;
+      if (f.can_dlc < 8)
+        continue;
+      if (f.data[1] != (uint8_t)(index & 0xFF))
+        continue;
+      if (f.data[2] != (uint8_t)((index >> 8) & 0xFF))
+        continue;
+      if (f.data[3] != sub)
+        continue;
 
       int32_t v = 0;
       v |= ((int32_t)f.data[4]) << 0;
@@ -206,23 +230,39 @@ private:
     ROS_INFO("Drive should now be in Profile Velocity, target=0, enabled.");
   }
 
-  void targetVelocityCb(const std_msgs::Float64::ConstPtr& msg){
-    double rpm = msg->data;
+static double msToRpm(double v_ms){
+  const double circ = M_PI * ROLLER_DIAMETER_M;
+  if (circ <= 0.0)
+    return 0.0;
+  return (v_ms / circ) * 60.0;
+}
+
+
+  
+  void velCb(const std_msgs::Float64::ConstPtr& msg) {
+    latest_vel_kf_ = msg->data;
+    have_vel_ = true;
+  }
+
+  void sendTargetAtRate(const ros::TimerEvent&) {
+    if (!have_vel_) return;
+
+    double rpm = msToRpm(latest_vel_kf_);
 
     if (rpm > MAX_RPM) rpm = MAX_RPM;
-    if (rpm < -MAX_RPM)rpm = -MAX_RPM;
+    if (rpm < -MAX_RPM) rpm = -MAX_RPM;
 
     double dec_f = rpm * 512.0 * (double)ENCODER_RES / 1875.0;
     int32_t dec = (int32_t)llround(dec_f);
 
     sdoWriteI32(0x60FF, 0x00, dec);
-
-    ROS_INFO("Sent target velocity: %.1f rpm (DEC=%d)", rpm, (int)dec);
   }
 
-  void pollActualVelocity(const ros::TimerEvent&){
+  void pollActualVelocity(const ros::TimerEvent&) {
     int32_t dec_val;
-    if (!sdoReadI32(0x606C, 0x00, &dec_val, 20))return;
+
+    if (!sdoReadI32(0x606C, 0x00, &dec_val, 20))
+      return;
 
     double rpm = (double)dec_val * 1875.0 / (512.0 * (double)ENCODER_RES);
 
@@ -231,6 +271,8 @@ private:
     pub_actual_vel_.publish(out);
   }
 };
+
+
 
 int main(int argc, char **argv){
   ros::init(argc, argv, "kinco_canopen_velocity_test");

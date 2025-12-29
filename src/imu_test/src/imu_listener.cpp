@@ -7,9 +7,7 @@
 // ----------------- helpers -----------------
 static inline double deg(double rad) { return rad * 180.0 / M_PI; }
 
-static void quatToRPY_ZYX(double qw, double qx, double qy, double qz,
-                          double &roll, double &pitch, double &yaw)
-{
+static void quatToRPY_ZYX(double qw, double qx, double qy, double qz, double &roll, double &pitch, double &yaw){
   // roll (x-axis)
   const double sinr_cosp = 2.0 * (qw * qx + qy * qz);
   const double cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy);
@@ -26,8 +24,7 @@ static void quatToRPY_ZYX(double qw, double qx, double qy, double qz,
   yaw = std::atan2(siny_cosp, cosy_cosp);
 }
 
-static std::string covStr(const boost::array<double, 9>& c)
-{
+static std::string covStr(const boost::array<double, 9>& c){
   // ROS convention: -1 means "unknown"
   // If first element is -1, we’ll treat as unknown.
   if (c[0] < 0.0) return "UNKNOWN";
@@ -47,14 +44,12 @@ static geometry_msgs::Vector3 g_vel_kf;
 static bool g_have_rpy = false;
 static bool g_have_vel = false;
 
-static void rpyCb(const geometry_msgs::Vector3::ConstPtr& msg)
-{
+static void rpyCb(const geometry_msgs::Vector3::ConstPtr& msg){
   g_rpy_deg = *msg;
   g_have_rpy = true;
 }
 
-static void velCb(const geometry_msgs::Vector3::ConstPtr& msg)
-{
+static void velCb(const geometry_msgs::Vector3::ConstPtr& msg){
   g_vel_kf = *msg;
   g_have_vel = true;
 }
@@ -62,8 +57,7 @@ static void velCb(const geometry_msgs::Vector3::ConstPtr& msg)
 // ----------------- main IMU callback -----------------
 static ros::Time g_last_print(0);
 
-void imuCallback(const sensor_msgs::Imu::ConstPtr& msg)
-{
+void imuCallback(const sensor_msgs::Imu::ConstPtr& msg){
   // Print throttling
   static double print_hz = 10.0;
   static bool compact = false;
@@ -158,8 +152,7 @@ void imuCallback(const sensor_msgs::Imu::ConstPtr& msg)
   ROS_INFO_STREAM(ss.str());
 }
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv){
   ros::init(argc, argv, "imu_listener_full");
   ros::NodeHandle nh;
   ros::NodeHandle pnh("~");
