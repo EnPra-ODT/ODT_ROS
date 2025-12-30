@@ -1,0 +1,15 @@
+# Normalize text files
+* text=auto
+
+# Keep shell scripts LF
+*.sh text eol=lf
+*.bash text eol=lf
+
+# C/C++ usually safe as LF too
+*.c   text eol=lf
+*.cpp text eol=lf
+*.h   text eol=lf
+*.hpp text eol=lf
+
+# Python
+*.py  text eol=lf
