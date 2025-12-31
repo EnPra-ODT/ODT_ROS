@@ -34,7 +34,6 @@ public:
     openCanSocket(CAN_IFACE);
 
     pub_actual_vel_ = nh.advertise<std_msgs::Float64>("actual_velocity_rpm", 10);
-    // sub_target_vel_ = nh.subscribe("target_velocity_rpm", 10, &KincoCanopenDriver::targetVelocityCb, this);
     sub_vel_kf_ = nh.subscribe("imu/vel_kf", 20, &KincoCanopenDriver::velCb, this);
 
     ROS_INFO("Initializing Kinco servo via SDO...");
@@ -230,15 +229,13 @@ private:
     ROS_INFO("Drive should now be in Profile Velocity, target=0, enabled.");
   }
 
-static double msToRpm(double v_ms){
-  const double circ = M_PI * ROLLER_DIAMETER_M;
-  if (circ <= 0.0)
-    return 0.0;
-  return (v_ms / circ) * 60.0;
-}
+  static double msToRpm(double v_ms){
+    const double circ = M_PI * ROLLER_DIAMETER_M;
+    if (circ <= 0.0)
+      return 0.0;
+    return (v_ms / circ) * 60.0;
+  }
 
-
-  
   void velCb(const std_msgs::Float64::ConstPtr& msg) {
     latest_vel_kf_ = msg->data;
     have_vel_ = true;
@@ -279,12 +276,12 @@ int main(int argc, char **argv){
   ros::NodeHandle nh;
 
   try {
-      KincoCanopenDriver driver(nh);
-      ROS_INFO("Kinco CANopen velocity test node (SDO-based feedback) started.");
-      ros::spin();
+    KincoCanopenDriver driver(nh);
+    ROS_INFO("Kinco CANopen velocity test node (SDO-based feedback) started.");
+    ros::spin();
   } catch (const std::exception& e) {
-      ROS_ERROR("Fatal: %s", e.what());
-      return 1;
+    ROS_ERROR("Fatal: %s", e.what());
+    return 1;
   }
 
   return 0;
