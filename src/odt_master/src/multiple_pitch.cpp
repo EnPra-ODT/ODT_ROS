@@ -24,235 +24,231 @@
 
 namespace kinco {
 
-struct MotorConfig {
-  int encoder_res = 65536;
-  int max_rpm = 5000;
-  double roller_diameter_m = 0.10;
+  struct MotorConfig {
+    int encoder_res = 65536;
+    int max_rpm = 5000;
+    double roller_diameter_m = 0.10;
 
-  // These scalars are from your existing conversion.
-  // Keep as-is unless your drive scaling differs.
-  double scale_num = 512.0 * 65536.0;  // 512 * encoder_res
-  double scale_den = 1875.0;          // denominator
-};
+    double scale_num = 512.0 * 65536.0;  // 512 * encoder_res
+    double scale_den = 1875.0;          // denominator
+  };
 
-class CanSocketBus {
-public:
-  explicit CanSocketBus(const std::string& ifname) { open(ifname); }
-  ~CanSocketBus() {
-    if (sock_ >= 0) ::close(sock_);
-  }
-
-  CanSocketBus(const CanSocketBus&) = delete;
-  CanSocketBus& operator=(const CanSocketBus&) = delete;
-
-  void sendFrame(uint32_t can_id, const uint8_t data[8]) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    struct can_frame frame;
-    std::memset(&frame, 0, sizeof(frame));
-    frame.can_id = can_id;
-    frame.can_dlc = 8;
-    std::memcpy(frame.data, data, 8);
-
-    int n = ::write(sock_, &frame, sizeof(frame));
-    if (n != (int)sizeof(frame)) {
-      std::ostringstream oss;
-      oss << "CAN write failed (n=" << n << " errno=" << errno << ")";
-      throw std::runtime_error(oss.str());
+  class CanSocketBus {
+  public:
+    explicit CanSocketBus(const std::string& ifname) { open(ifname); }
+    ~CanSocketBus() {
+      if (sock_ >= 0) ::close(sock_);
     }
-  }
 
-  bool recvFrame(struct can_frame* out, int timeout_ms) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    fd_set rfds;
-    struct timeval tv;
-    FD_ZERO(&rfds);
-    FD_SET(sock_, &rfds);
+    CanSocketBus(const CanSocketBus&) = delete;
+    CanSocketBus& operator=(const CanSocketBus&) = delete;
 
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    void sendFrame(uint32_t can_id, const uint8_t data[8]) {
+      std::lock_guard<std::mutex> lk(mtx_);
+      struct can_frame frame;
+      std::memset(&frame, 0, sizeof(frame));
+      frame.can_id = can_id;
+      frame.can_dlc = 8;
+      std::memcpy(frame.data, data, 8);
 
-    int ret = ::select(sock_ + 1, &rfds, nullptr, nullptr, &tv);
-    if (ret <= 0) return false;
+      int n = ::write(sock_, &frame, sizeof(frame));
+      if (n != (int)sizeof(frame)) {
+        std::ostringstream oss;
+        oss << "CAN write failed (n=" << n << " errno=" << errno << ")";
+        throw std::runtime_error(oss.str());
+      }
+    }
 
-    int n = ::read(sock_, out, sizeof(*out));
-    return n == (int)sizeof(*out);
-  }
+    bool recvFrame(struct can_frame* out, int timeout_ms) {
+      std::lock_guard<std::mutex> lk(mtx_);
+      fd_set rfds;
+      struct timeval tv;
+      FD_ZERO(&rfds);
+      FD_SET(sock_, &rfds);
 
-private:
-  int sock_ = -1;
-  std::mutex mtx_;
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-  void open(const std::string& ifname) {
-    struct ifreq ifr;
-    struct sockaddr_can addr;
+      int ret = ::select(sock_ + 1, &rfds, nullptr, nullptr, &tv);
+      if (ret <= 0) return false;
 
-    sock_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (sock_ < 0) throw std::runtime_error("socket(PF_CAN) failed");
+      int n = ::read(sock_, out, sizeof(*out));
+      return n == (int)sizeof(*out);
+    }
 
-    std::memset(&ifr, 0, sizeof(ifr));
-    std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname.c_str());
-    if (::ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) throw std::runtime_error("ioctl(SIOCGIFINDEX) failed");
+  private:
+    int sock_ = -1;
+    std::mutex mtx_;
 
-    std::memset(&addr, 0, sizeof(addr));
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
+    void open(const std::string& ifname) {
+      struct ifreq ifr;
+      struct sockaddr_can addr;
 
-    if (::bind(sock_, (struct sockaddr*)&addr, sizeof(addr)) < 0) throw std::runtime_error("bind(AF_CAN) failed");
+      sock_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+      if (sock_ < 0) throw std::runtime_error("socket(PF_CAN) failed");
 
-    ROS_INFO("SocketCAN bound to interface: %s", ifname.c_str());
-  }
-};
+      std::memset(&ifr, 0, sizeof(ifr));
+      std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname.c_str());
+      if (::ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) throw std::runtime_error("ioctl(SIOCGIFINDEX) failed");
 
-class SdoClient {
-public:
-  SdoClient(CanSocketBus& bus, int node_id) : bus_(bus), node_id_(node_id) {}
+      std::memset(&addr, 0, sizeof(addr));
+      addr.can_family = AF_CAN;
+      addr.can_ifindex = ifr.ifr_ifindex;
 
-  void writeU16(uint16_t index, uint8_t sub, uint16_t val) {
-    uint8_t b[2];
-    b[0] = (uint8_t)(val & 0xFF);
-    b[1] = (uint8_t)((val >> 8) & 0xFF);
-    sendSdo(0x2B, index, sub, b, 2);
-  }
+      if (::bind(sock_, (struct sockaddr*)&addr, sizeof(addr)) < 0) throw std::runtime_error("bind(AF_CAN) failed");
 
-  void writeI8(uint16_t index, uint8_t sub, int8_t val) {
-    uint8_t b[1];
-    b[0] = (uint8_t)val;
-    sendSdo(0x2F, index, sub, b, 1);
-  }
+      ROS_INFO("SocketCAN bound to interface: %s", ifname.c_str());
+    }
+  };
 
-  void writeI32(uint16_t index, uint8_t sub, int32_t val) {
-    uint8_t b[4];
-    b[0] = (uint8_t)(val & 0xFF);
-    b[1] = (uint8_t)((val >> 8) & 0xFF);
-    b[2] = (uint8_t)((val >> 16) & 0xFF);
-    b[3] = (uint8_t)((val >> 24) & 0xFF);
-    sendSdo(0x23, index, sub, b, 4);
-  }
+  class SdoClient {
+  public:
+    SdoClient(CanSocketBus& bus, int node_id) : bus_(bus), node_id_(node_id) {}
 
-  bool readI32(uint16_t index, uint8_t sub, int32_t* out_val, int window_ms) {
-    const uint32_t req_cob = 0x600 + (uint32_t)node_id_;
-    const uint32_t rep_cob = 0x580 + (uint32_t)node_id_;
+    void writeU16(uint16_t index, uint8_t sub, uint16_t val) {
+      uint8_t b[2];
+      b[0] = (uint8_t)(val & 0xFF);
+      b[1] = (uint8_t)((val >> 8) & 0xFF);
+      sendSdo(0x2B, index, sub, b, 2);
+    }
 
-    // Request upload
-    uint8_t req[8];
-    std::memset(req, 0, sizeof(req));
-    req[0] = 0x40;
-    req[1] = (uint8_t)(index & 0xFF);
-    req[2] = (uint8_t)((index >> 8) & 0xFF);
-    req[3] = sub;
-    bus_.sendFrame(req_cob, req);
+    void writeI8(uint16_t index, uint8_t sub, int8_t val) {
+      uint8_t b[1];
+      b[0] = (uint8_t)val;
+      sendSdo(0x2F, index, sub, b, 1);
+    }
 
-    const ros::Time end = ros::Time::now() + ros::Duration(window_ms / 1000.0);
-    while (ros::Time::now() < end && ros::ok()) {
-      struct can_frame f;
-      if (!bus_.recvFrame(&f, 5)) continue;
+    void writeI32(uint16_t index, uint8_t sub, int32_t val) {
+      uint8_t b[4];
+      b[0] = (uint8_t)(val & 0xFF);
+      b[1] = (uint8_t)((val >> 8) & 0xFF);
+      b[2] = (uint8_t)((val >> 16) & 0xFF);
+      b[3] = (uint8_t)((val >> 24) & 0xFF);
+      sendSdo(0x23, index, sub, b, 4);
+    }
 
-      if ((f.can_id & CAN_EFF_MASK) != rep_cob) continue;
-      if (f.can_dlc < 8) continue;
-      if (f.data[1] != (uint8_t)(index & 0xFF)) continue;
-      if (f.data[2] != (uint8_t)((index >> 8) & 0xFF)) continue;
-      if (f.data[3] != sub) continue;
+    bool readI32(uint16_t index, uint8_t sub, int32_t* out_val, int window_ms) {
+      const uint32_t req_cob = 0x600 + (uint32_t)node_id_;
+      const uint32_t rep_cob = 0x580 + (uint32_t)node_id_;
 
-      int32_t v = 0;
-      v |= ((int32_t)f.data[4]) << 0;
-      v |= ((int32_t)f.data[5]) << 8;
-      v |= ((int32_t)f.data[6]) << 16;
-      v |= ((int32_t)f.data[7]) << 24;
-      *out_val = v;
+      // Request upload
+      uint8_t req[8];
+      std::memset(req, 0, sizeof(req));
+      req[0] = 0x40;
+      req[1] = (uint8_t)(index & 0xFF);
+      req[2] = (uint8_t)((index >> 8) & 0xFF);
+      req[3] = sub;
+      bus_.sendFrame(req_cob, req);
+
+      const ros::Time end = ros::Time::now() + ros::Duration(window_ms / 1000.0);
+      while (ros::Time::now() < end && ros::ok()) {
+        struct can_frame f;
+        if (!bus_.recvFrame(&f, 5)) continue;
+
+        if ((f.can_id & CAN_EFF_MASK) != rep_cob) continue;
+        if (f.can_dlc < 8) continue;
+        if (f.data[1] != (uint8_t)(index & 0xFF)) continue;
+        if (f.data[2] != (uint8_t)((index >> 8) & 0xFF)) continue;
+        if (f.data[3] != sub) continue;
+
+        int32_t v = 0;
+        v |= ((int32_t)f.data[4]) << 0;
+        v |= ((int32_t)f.data[5]) << 8;
+        v |= ((int32_t)f.data[6]) << 16;
+        v |= ((int32_t)f.data[7]) << 24;
+        *out_val = v;
+        return true;
+      }
+      return false;
+    }
+
+    int nodeId() const { return node_id_; }
+
+  private:
+    CanSocketBus& bus_;
+    int node_id_;
+
+    void sendSdo(uint8_t cs, uint16_t index, uint8_t sub, const uint8_t* data_bytes, int data_len) {
+      const uint32_t cob_id = 0x600 + (uint32_t)node_id_;
+      uint8_t data[8];
+      std::memset(data, 0, sizeof(data));
+      data[0] = cs;
+      data[1] = (uint8_t)(index & 0xFF);
+      data[2] = (uint8_t)((index >> 8) & 0xFF);
+      data[3] = sub;
+
+      for (int i = 0; i < data_len && i < 4; i++) data[4 + i] = data_bytes[i];
+      bus_.sendFrame(cob_id, data);
+    }
+  };
+
+  class KincoMotor {
+  public:
+    KincoMotor(CanSocketBus& bus, int node_id, MotorConfig cfg)
+        : cfg_(cfg), sdo_(bus, node_id) {
+      cfg_.scale_num = 512.0 * (double)cfg_.encoder_res;  // keep consistent
+    }
+
+    int nodeId() const { return sdo_.nodeId(); }
+
+    void initProfileVelocityMode() {
+      // 6040=0006 (Shutdown)
+      // 6040=0007 (Switch on)
+      // 6060=3    (Profile Velocity)
+      // 60FF=0    (Target velocity = 0)
+      // 6040=000F (Enable operation)
+      sdo_.writeU16(0x6040, 0x00, 0x0006);
+      ros::Duration(0.05).sleep();
+      sdo_.writeU16(0x6040, 0x00, 0x0007);
+      ros::Duration(0.05).sleep();
+      sdo_.writeI8(0x6060, 0x00, 3);
+      ros::Duration(0.05).sleep();
+      sdo_.writeI32(0x60FF, 0x00, 0);
+      ros::Duration(0.05).sleep();
+      sdo_.writeU16(0x6040, 0x00, 0x000F);
+      ros::Duration(0.05).sleep();
+
+      ROS_INFO("Node %d: Profile Velocity enabled (target=0).", nodeId());
+    }
+
+    void setTargetRpm(double rpm) {
+      if (rpm > cfg_.max_rpm) rpm = cfg_.max_rpm;
+      if (rpm < -cfg_.max_rpm) rpm = -cfg_.max_rpm;
+
+      const int32_t dec = rpmToDriveUnits(rpm);
+      sdo_.writeI32(0x60FF, 0x00, dec);
+    }
+
+    void setTargetLinearMs(double v_ms) { setTargetRpm(msToRpm(v_ms)); }
+
+    bool readActualRpm(double* out_rpm, int window_ms = 20) {
+      int32_t dec_val = 0;
+      if (!sdo_.readI32(0x606C, 0x00, &dec_val, window_ms)) return false;
+      *out_rpm = driveUnitsToRpm(dec_val);
       return true;
     }
-    return false;
-  }
 
-  int nodeId() const { return node_id_; }
+    double msToRpm(double v_ms) const {
+      const double circ = M_PI * cfg_.roller_diameter_m;
+      if (circ <= 0.0) return 0.0;
+      return (v_ms / circ) * 60.0;
+    }
 
-private:
-  CanSocketBus& bus_;
-  int node_id_;
+  private:
+    MotorConfig cfg_;
+    SdoClient sdo_;
 
-  void sendSdo(uint8_t cs, uint16_t index, uint8_t sub, const uint8_t* data_bytes, int data_len) {
-    const uint32_t cob_id = 0x600 + (uint32_t)node_id_;
-    uint8_t data[8];
-    std::memset(data, 0, sizeof(data));
-    data[0] = cs;
-    data[1] = (uint8_t)(index & 0xFF);
-    data[2] = (uint8_t)((index >> 8) & 0xFF);
-    data[3] = sub;
+    int32_t rpmToDriveUnits(double rpm) const {
+      const double dec_f = rpm * cfg_.scale_num / cfg_.scale_den;
+      return (int32_t)llround(dec_f);
+    }
 
-    for (int i = 0; i < data_len && i < 4; i++) data[4 + i] = data_bytes[i];
-    bus_.sendFrame(cob_id, data);
-  }
-};
+    double driveUnitsToRpm(int32_t dec) const {
+      return (double)dec * cfg_.scale_den / cfg_.scale_num;
+    }
+  };
 
-class KincoMotor {
-public:
-  KincoMotor(CanSocketBus& bus, int node_id, MotorConfig cfg)
-      : cfg_(cfg), sdo_(bus, node_id) {
-    cfg_.scale_num = 512.0 * (double)cfg_.encoder_res;  // keep consistent
-  }
-
-  int nodeId() const { return sdo_.nodeId(); }
-
-  void initProfileVelocityMode() {
-    // 6040=0006 (Shutdown)
-    // 6040=0007 (Switch on)
-    // 6060=3    (Profile Velocity)
-    // 60FF=0    (Target velocity = 0)
-    // 6040=000F (Enable operation)
-    sdo_.writeU16(0x6040, 0x00, 0x0006);
-    ros::Duration(0.05).sleep();
-    sdo_.writeU16(0x6040, 0x00, 0x0007);
-    ros::Duration(0.05).sleep();
-    sdo_.writeI8(0x6060, 0x00, 3);
-    ros::Duration(0.05).sleep();
-    sdo_.writeI32(0x60FF, 0x00, 0);
-    ros::Duration(0.05).sleep();
-    sdo_.writeU16(0x6040, 0x00, 0x000F);
-    ros::Duration(0.05).sleep();
-
-    ROS_INFO("Node %d: Profile Velocity enabled (target=0).", nodeId());
-  }
-
-  void setTargetRpm(double rpm) {
-    if (rpm > cfg_.max_rpm) rpm = cfg_.max_rpm;
-    if (rpm < -cfg_.max_rpm) rpm = -cfg_.max_rpm;
-
-    const int32_t dec = rpmToDriveUnits(rpm);
-    sdo_.writeI32(0x60FF, 0x00, dec);
-  }
-
-  void setTargetLinearMs(double v_ms) { setTargetRpm(msToRpm(v_ms)); }
-
-  bool readActualRpm(double* out_rpm, int window_ms = 20) {
-    int32_t dec_val = 0;
-    if (!sdo_.readI32(0x606C, 0x00, &dec_val, window_ms)) return false;
-    *out_rpm = driveUnitsToRpm(dec_val);
-    return true;
-  }
-
-  double msToRpm(double v_ms) const {
-    const double circ = M_PI * cfg_.roller_diameter_m;
-    if (circ <= 0.0) return 0.0;
-    return (v_ms / circ) * 60.0;
-  }
-
-private:
-  MotorConfig cfg_;
-  SdoClient sdo_;
-
-  int32_t rpmToDriveUnits(double rpm) const {
-    // Your original: dec = rpm * 512 * ENCODER_RES / 1875
-    const double dec_f = rpm * cfg_.scale_num / cfg_.scale_den;
-    return (int32_t)llround(dec_f);
-  }
-
-  double driveUnitsToRpm(int32_t dec) const {
-    // Your original: rpm = dec * 1875 / (512 * ENCODER_RES)
-    return (double)dec * cfg_.scale_den / cfg_.scale_num;
-  }
-};
-
-}  // namespace kinco
+}
 
 // ---- Outside-the-class helpers (what you asked for) ----
 static void update_motor_speed_ms(kinco::KincoMotor& m, double v_ms) { m.setTargetLinearMs(v_ms); }
@@ -295,9 +291,9 @@ int main(int argc, char** argv) {
     pnh.param<std::string>("can_iface", can_iface, std::string("can0"));
 
     kinco::MotorConfig cfg;
-    pnh.param<int>("encoder_res", cfg.encoder_res, 65536);
-    pnh.param<int>("max_rpm", cfg.max_rpm, 5000);
-    pnh.param<double>("roller_diameter_m", cfg.roller_diameter_m, 0.10);
+    pnh.param<int>("encoder_res", cfg.encoder_res, encoder_res);
+    pnh.param<int>("max_rpm", cfg.max_rpm, max_rpm);
+    pnh.param<double>("roller_diameter_m", cfg.roller_diameter_m, roller_diameter_m);
     cfg.scale_num = 512.0 * (double)cfg.encoder_res;
 
     double cmd_refresh_hz = 50.0;
