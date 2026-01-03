@@ -22,6 +22,22 @@
 #include <linux/can.h>
 #include <linux/can/raw.h>
 
+
+
+//=============== Control Ward Definitions (0x6040) ===============//
+constexpr uint16_t CW_SWITCH_ON = 0x0001;
+constexpr uint16_t CW_ENABLE_VOLTAGE = 0x0002;
+constexpr uint16_t CW_QUICK_STOP = 0x0004;
+constexpr uint16_t CW_SHUTDOWN = 0x0006;
+constexpr uint16_t CW_SWITCH_ON = 0x0007;
+constexpr uint16_t CW_ENABLE_OPERATION = 0x000F;
+constexpr uint16_t CW_OPERATION_MODE_SPECIFIC_ONE = 0x0010;
+constexpr uint16_t CW_OPERATION_MODE_SPECIFIC_TWO = 0x0020;
+constexpr uint16_t CW_OPERATION_MODE_SPECIFIC_FOUR = 0x0040;
+constexpr uint16_t CW_FAULT_RESET = 0x0080;
+constexpr uint16_t CW_HALT_MANUFACTURER_SPECIFIC = 0x0100;
+//=================================================================//
+
 namespace kinco {
 
   struct MotorConfig {
@@ -184,8 +200,7 @@ namespace kinco {
 
   class KincoMotor {
   public:
-    KincoMotor(CanSocketBus& bus, int node_id, MotorConfig cfg)
-        : cfg_(cfg), sdo_(bus, node_id) {
+    KincoMotor(CanSocketBus& bus, int node_id, MotorConfig cfg)  : cfg_(cfg), sdo_(bus, node_id) {
       cfg_.scale_num = 512.0 * (double)cfg_.encoder_res;  // keep consistent
     }
 
@@ -197,15 +212,15 @@ namespace kinco {
       // 6060=3    (Profile Velocity)
       // 60FF=0    (Target velocity = 0)
       // 6040=000F (Enable operation)
-      sdo_.writeU16(0x6040, 0x00, 0x0006);
+      sdo_.writeU16(0x6040, 0x00, CW_SHUTDOWN);          //Shutdown
       ros::Duration(0.05).sleep();
-      sdo_.writeU16(0x6040, 0x00, 0x0007);
+      sdo_.writeU16(0x6040, 0x00, CW_SWITCH_ON);          //Switch On
       ros::Duration(0.05).sleep();
-      sdo_.writeI8(0x6060, 0x00, 3);
+      sdo_.writeI8(0x6060, 0x00, 3);                //Profile Velocity
       ros::Duration(0.05).sleep();
-      sdo_.writeI32(0x60FF, 0x00, 0);
+      sdo_.writeI32(0x60FF, 0x00, 0);               //Target Velocity = 0
       ros::Duration(0.05).sleep();
-      sdo_.writeU16(0x6040, 0x00, 0x000F);
+      sdo_.writeU16(0x6040, 0x00, CW_ENABLE_OPERATION);          //Enable Operation
       ros::Duration(0.05).sleep();
 
       ROS_INFO("Node %d: Profile Velocity enabled (target=0).", nodeId());
@@ -291,15 +306,15 @@ int main(int argc, char** argv) {
     pnh.param<std::string>("can_iface", can_iface, std::string("can0"));
 
     kinco::MotorConfig cfg;
-    pnh.param<int>("encoder_res", cfg.encoder_res, encoder_res);
-    pnh.param<int>("max_rpm", cfg.max_rpm, max_rpm);
-    pnh.param<double>("roller_diameter_m", cfg.roller_diameter_m, roller_diameter_m);
+    pnh.param<int>("encoder_res", cfg.encoder_res, cfg.encoder_res);
+    pnh.param<int>("max_rpm", cfg.max_rpm, cfg.max_rpm);
+    pnh.param<double>("roller_diameter_m", cfg.roller_diameter_m, cfg.roller_diameter_m);
     cfg.scale_num = 512.0 * (double)cfg.encoder_res;
 
     double cmd_refresh_hz = 50.0;
     double poll_hz = 20.0;
-    pnh.param<double>("cmd_refresh_hz", cmd_refresh_hz, 50.0);
-    pnh.param<double>("poll_hz", poll_hz, 20.0);
+    pnh.param<double>("cmd_refresh_hz", cmd_refresh_hz, cmd_refresh_hz);
+    pnh.param<double>("poll_hz", poll_hz, poll_hz);
     if (cmd_refresh_hz <= 0.0) throw std::runtime_error("~cmd_refresh_hz must be > 0");
     if (poll_hz <= 0.0) throw std::runtime_error("~poll_hz must be > 0");
 
