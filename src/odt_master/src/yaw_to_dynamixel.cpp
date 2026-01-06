@@ -64,8 +64,7 @@ static inline int32_t clampI32(int32_t v, int32_t lo, int32_t hi) {
 }
 
 // Unwrap yaw in degrees to be continuous (NEW)
-static double unwrapYawDeg(double yaw_deg_wrapped)
-{
+static double unwrapYawDeg(double yaw_deg_wrapped){
   if (!g_have_yaw_prev) {
     g_have_yaw_prev = true;
     g_yaw_prev_deg = yaw_deg_wrapped;
