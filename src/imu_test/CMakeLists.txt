@@ -138,12 +138,16 @@ include_directories(
 ## Declare a C++ executable
 add_executable(imu_listener src/imu_listener.cpp)
 add_executable(imu_scalar_pub src/imu_scalar_pub.cpp)
+add_executable(imu_kf_logger src/imu_kf_logger.cpp)
 
 ## Link the executable against catkin libraries
 target_link_libraries(imu_listener
   ${catkin_LIBRARIES}
 )
 target_link_libraries(imu_scalar_pub
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(imu_kf_logger
   ${catkin_LIBRARIES}
 )
 
