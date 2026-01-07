@@ -25,7 +25,7 @@
 
 
 //=============== Control Ward Definitions (0x6040) ===============//
-constexpr uint16_t CW_SWITCH_ON = 0x0001;
+//constexpr uint16_t CW_SWITCH_ON = 0x0001;
 constexpr uint16_t CW_ENABLE_VOLTAGE = 0x0002;
 constexpr uint16_t CW_QUICK_STOP = 0x0004;
 constexpr uint16_t CW_SHUTDOWN = 0x0006;

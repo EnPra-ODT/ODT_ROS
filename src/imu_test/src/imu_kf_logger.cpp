@@ -7,8 +7,7 @@
 #include <limits>
 #include <string>
 
-static inline void quatNormalize(double &w, double &x, double &y, double &z)
-{
+static inline void quatNormalize(double &w, double &x, double &y, double &z){
     double n = std::sqrt(w*w + x*x + y*y + z*z);
     if (n < 1e-12) {
         w = 1.0; x = 0.0; y = 0.0; z = 0.0;
@@ -18,11 +17,7 @@ static inline void quatNormalize(double &w, double &x, double &y, double &z)
     w *= inv; x *= inv; y *= inv; z *= inv;
 }
 
-static inline void quatRotateWorldFromBody(
-    double qw, double qx, double qy, double qz,
-    double vx, double vy, double vz,
-    double &vpx, double &vpy, double &vpz)
-{
+static inline void quatRotateWorldFromBody(double qw, double qx, double qy, double qz, double vx, double vy, double vz, double &vpx, double &vpy, double &vpz){
     // Optimized: t = 2*cross(q_vec, v); v' = v + qw*t + cross(q_vec, t)
     double tx = 2.0 * (qy * vz - qz * vy);
     double ty = 2.0 * (qz * vx - qx * vz);
@@ -55,8 +50,7 @@ struct AxisState {
 
 class ImuKfLogger {
 public:
-    ImuKfLogger(ros::NodeHandle &nh)
-    {
+    ImuKfLogger(ros::NodeHandle &nh){
         // Params
         nh.param<std::string>("topic", topic_, std::string("/imu_data_left"));
         nh.param<std::string>("out_csv", out_csv_, std::string("imu_log_ros.csv"));
@@ -96,14 +90,12 @@ public:
         ROS_INFO_STREAM("Subscribed to " << topic_ << ", logging to " << out_csv_);
     }
 
-    ~ImuKfLogger()
-    {
+    ~ImuKfLogger(){
         if (file_.is_open()) file_.close();
     }
 
 private:
-    void cb(const std_msgs::Float64MultiArray::ConstPtr &msg)
-    {
+    void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
         const auto &d = msg->data;
 
         bool have_quat = false;
@@ -182,9 +174,7 @@ private:
         file_.flush();
     }
 
-    double processAxis(const std::string &axis, double a_in, double deadband,
-                       double F00, double F01, double F10, double F11, double dt)
-    {
+    double processAxis(const std::string &axis, double a_in, double deadband, double F00, double F01, double F10, double F11, double dt){
         AxisState *S = nullptr;
         if (axis == "x") S = &x_;
         else if (axis == "y") S = &y_;
@@ -277,8 +267,7 @@ private:
     AxisState x_, y_, z_;
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv){
     ros::init(argc, argv, "imu_kf_logger");
     ros::NodeHandle nh("~");
 
