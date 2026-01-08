@@ -108,7 +108,7 @@ private:
         const double vy = y_.v2;
         const double vz = z_.v2;
 
-        const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz);
+        const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz)*100; //cm/s
 
         vmag_msg_.data = v_mag;
         vmag_pub_.publish(vmag_msg_);
