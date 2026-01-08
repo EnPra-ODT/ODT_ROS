@@ -8,28 +8,6 @@
 #include <limits>
 #include <string>
 
-static inline void quatNormalize(double &w, double &x, double &y, double &z)
-{
-    double n = std::sqrt(w*w + x*x + y*y + z*z);
-    if (n < 1e-12) { w = 1.0; x = 0.0; y = 0.0; z = 0.0; return; }
-    double inv = 1.0 / n;
-    w *= inv; x *= inv; y *= inv; z *= inv;
-}
-
-static inline void quatRotateWorldFromBody(
-    double qw, double qx, double qy, double qz,
-    double vx, double vy, double vz,
-    double &vpx, double &vpy, double &vpz)
-{
-    double tx = 2.0 * (qy * vz - qz * vy);
-    double ty = 2.0 * (qz * vx - qx * vz);
-    double tz = 2.0 * (qx * vy - qy * vx);
-
-    vpx = vx + qw * tx + (qy * tz - qz * ty);
-    vpy = vy + qw * ty + (qz * tx - qx * tz);
-    vpz = vz + qw * tz + (qx * ty - qy * tx);
-}
-
 struct AxisState {
     int still_count = 0;
 
@@ -78,7 +56,6 @@ public:
               << "ax_raw_mps2,ay_raw_mps2,az_raw_mps2,"
               << "ax_kf_mps2,ay_kf_mps2,az_kf_mps2,"
               << "vx_2state_kf_lightlpf_mps,vy_2state_kf_lightlpf_mps,vz_2state_kf_lightlpf_mps,"
-              << "vx_world_from_kf_mps,vy_world_from_kf_mps,vz_world_from_kf_mps,"
               << "v_mag\n";
         file_.flush();
 
@@ -96,6 +73,7 @@ public:
         ROS_INFO_STREAM("CSV logging to: " << out_csv_ << " (relative path uses node working dir, often ~/.ros)");
         ROS_INFO_STREAM("Subscribed to topic: " << topic_);
         ROS_INFO("Publishing v_mag on: /v_mag");
+        ROS_INFO("NOTE: Quaternion/world rotation removed. Expecting msg->data size == 4: [t_ms, ax, ay, az].");
     }
 
     ~ImuKfLogger()
@@ -120,23 +98,16 @@ private:
         last_msg_time_ = ros::Time::now();
 
         const auto &d = msg->data;
-        bool have_quat = false;
 
-        double t_ms = 0.0;
-        double qw = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
-        double ax = 0.0, ay = 0.0, az = 0.0;
-
-        if (d.size() == 4) {
-            t_ms = d[0];
-            ax = d[1]; ay = d[2]; az = d[3];
-        } else if (d.size() == 8) {
-            t_ms = d[0];
-            qw = d[1]; qx = d[2]; qy = d[3]; qz = d[4];
-            ax = d[5]; ay = d[6]; az = d[7];
-            have_quat = true;
-        } else {
+        // Only accept: [t_ms, ax, ay, az]
+        if (d.size() != 4) {
             return;
         }
+
+        double t_ms = d[0];
+        double ax   = d[1];
+        double ay   = d[2];
+        double az   = d[3];
 
         if (!have_prev_time_) {
             t_prev_ms_ = t_ms;
@@ -149,40 +120,31 @@ private:
 
         if (dt < dt_min_ || dt > dt_max_) return;
 
-        if (have_quat) quatNormalize(qw, qx, qy, qz);
-
         const double F00 = 1.0, F01 = -dt;
         const double F10 = 0.0, F11 = 1.0;
 
-        double a_raw_x = ax, a_raw_y = ay, a_raw_z = az;
+        const double a_raw_x = ax;
+        const double a_raw_y = ay;
+        const double a_raw_z = az;
 
         double a_kf_x = processAxis(x_, ax, deadband_x_, F00, F01, F10, F11, dt);
         double a_kf_y = processAxis(y_, ay, deadband_y_, F00, F01, F10, F11, dt);
         double a_kf_z = processAxis(z_, az, deadband_z_, F00, F01, F10, F11, dt);
 
-        const double vx_b = x_.v2;
-        const double vy_b = y_.v2;
-        const double vz_b = z_.v2;
+        const double vx = x_.v2;
+        const double vy = y_.v2;
+        const double vz = z_.v2;
 
-        double vx_w = std::numeric_limits<double>::quiet_NaN();
-        double vy_w = std::numeric_limits<double>::quiet_NaN();
-        double vz_w = std::numeric_limits<double>::quiet_NaN();
-        double v_mag = std::numeric_limits<double>::quiet_NaN();
+        const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz);
 
-        if (have_quat) {
-            quatRotateWorldFromBody(qw, qx, qy, qz, vx_b, vy_b, vz_b, vx_w, vy_w, vz_w);
-            v_mag = std::sqrt(vx_w*vx_w + vy_w*vy_w + vz_w*vz_w);
-
-            vmag_msg_.data = v_mag;
-            vmag_pub_.publish(vmag_msg_);
-        }
+        vmag_msg_.data = v_mag;
+        vmag_pub_.publish(vmag_msg_);
 
         file_ << std::fixed << std::setprecision(6)
               << t_ms << ","
               << a_raw_x << "," << a_raw_y << "," << a_raw_z << ","
               << a_kf_x  << "," << a_kf_y  << "," << a_kf_z  << ","
-              << vx_b    << "," << vy_b    << "," << vz_b    << ","
-              << vx_w    << "," << vy_w    << "," << vz_w    << ","
+              << vx      << "," << vy      << "," << vz      << ","
               << v_mag << "\n";
         file_.flush();
     }
@@ -190,7 +152,7 @@ private:
     double processAxis(AxisState &S, double a_in, double deadband,
                        double F00, double F01, double F10, double F11, double dt)
     {
-        // 1D accel KF
+        // 1D accel KF (with deadbanded measurement)
         double z = a_in;
         if (std::abs(z) < deadband) z = 0.0;
 
@@ -199,7 +161,7 @@ private:
         S.a_hat = S.a_hat + K * (z - S.a_hat);
         S.P_1d  = (1.0 - K) * S.P_1d;
 
-        // light LPF (u)
+        // light LPF for u (uses raw accel input)
         double a_light;
         if (!S.has_light_prev) {
             a_light = a_in;
@@ -210,7 +172,7 @@ private:
         S.a_light_prev = a_light;
         const double u_lpf = a_light;
 
-        // stillness
+        // stillness detection (deadband on u_lpf)
         if (std::abs(u_lpf) <= deadband) S.still_count += 1;
         else S.still_count = 0;
         const bool still = (S.still_count >= zupt_steps_);
@@ -234,7 +196,7 @@ private:
 
         S.P00 = P00p; S.P01 = P01p; S.P10 = P10p; S.P11 = P11p;
 
-        // ZUPT update
+        // ZUPT update (measurement: v = 0)
         if (still) {
             double y = -S.v2;
             double Sm = S.P00 + r_zupt_;
