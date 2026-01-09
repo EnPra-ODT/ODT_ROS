@@ -61,8 +61,7 @@ public:
     }
 
 private:
-    void watchdogCb(const ros::TimerEvent &)
-    {
+    void watchdogCb(const ros::TimerEvent &){
         if (last_msg_time_.isZero()) {
             ROS_WARN_THROTTLE(2.0, "No IMU messages received yet.");
             return;
@@ -72,13 +71,9 @@ private:
         }
     }
 
-    void cb(const std_msgs::Float64MultiArray::ConstPtr &msg)
-    {
+    void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
         last_msg_time_ = ros::Time::now();
-
         const auto &d = msg->data;
-
-        // Expect: [t_ms, ax, ay, az]
         if (d.size() != 4) return;
 
         double t_ms = d[0];
@@ -114,9 +109,7 @@ private:
         vmag_pub_.publish(vmag_msg_);
     }
 
-    double processAxis(AxisState &S, double a_in, double deadband,
-                       double F00, double F01, double F10, double F11, double dt)
-    {
+    double processAxis(AxisState &S, double a_in, double deadband,double F00, double F01, double F10, double F11, double dt){
         // 1D accel KF
         double z = a_in;
         if (std::abs(z) < deadband) z = 0.0;
@@ -126,14 +119,13 @@ private:
         S.a_hat += K * (z - S.a_hat);
         S.P_1d  *= (1.0 - K);
 
-        // Light LPF (control input)
+        //Weak LPF
         double a_light;
         if (!S.has_light_prev) {
             a_light = a_in;
             S.has_light_prev = true;
         } else {
-            a_light = lpf_alpha_ * S.a_light_prev +
-                      (1.0 - lpf_alpha_) * a_in;
+            a_light = lpf_alpha_ * S.a_light_prev + (1.0 - lpf_alpha_) * a_in;
         }
         S.a_light_prev = a_light;
 
@@ -203,8 +195,7 @@ private:
     AxisState x_, y_, z_;
 };
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv){
     ros::init(argc, argv, "imu_kf_logger");
     ros::NodeHandle nh("~");
 
