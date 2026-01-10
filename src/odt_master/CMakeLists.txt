@@ -136,9 +136,6 @@ include_directories(
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
 # add_executable(${PROJECT_NAME}_node src/odt_master_node.cpp)
-add_executable(yaw_to_dynamixel src/yaw_to_dynamixel.cpp)
-add_executable(pitch_driver src/pitch_driver.cpp)
-add_executable(multiple_pitch src/multiple_pitch.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -154,10 +151,6 @@ add_executable(multiple_pitch src/multiple_pitch.cpp)
 # target_link_libraries(${PROJECT_NAME}_node
 #   ${catkin_LIBRARIES}
 # )
-target_link_libraries(yaw_to_dynamixel ${catkin_LIBRARIES})
-target_link_libraries(pitch_driver ${catkin_LIBRARIES})
-target_link_libraries(multiple_pitch ${catkin_LIBRARIES})
-
 #############
 ## Install ##
 #############

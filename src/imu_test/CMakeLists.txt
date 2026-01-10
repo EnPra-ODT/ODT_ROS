@@ -139,6 +139,7 @@ include_directories(
 add_executable(imu_listener src/imu_listener.cpp)
 add_executable(imu_scalar_pub src/imu_scalar_pub.cpp)
 add_executable(imu_kf_logger src/imu_kf_logger.cpp)
+add_executable(yaw_to_dynamixel src/yaw_to_dynamixel.cpp)
 
 ## Link the executable against catkin libraries
 target_link_libraries(imu_listener
@@ -148,6 +149,9 @@ target_link_libraries(imu_scalar_pub
   ${catkin_LIBRARIES}
 )
 target_link_libraries(imu_kf_logger
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(yaw_to_dynamixel
   ${catkin_LIBRARIES}
 )
 
