@@ -16,7 +16,7 @@
     <param name="q_b" value="0.01" />
     <param name="r_zupt" value="1e-4" />
     <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.050" />
+    <param name="dt_max" value="0.10" />
   </node>
 
   <!-- RIGHT -->
@@ -35,6 +35,6 @@
     <param name="q_b" value="0.01" />
     <param name="r_zupt" value="1e-4" />
     <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.050" />
+    <param name="dt_max" value="0.10" />
   </node>
 </launch>
