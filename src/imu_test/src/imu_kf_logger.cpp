@@ -74,7 +74,7 @@ private:
     void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
         last_msg_time_ = ros::Time::now();
         const auto &d = msg->data;
-        if (d.size() != 4) return;
+        if (d.size() != 7) return;
 
         double t_ms = d[0];
         double ax   = d[1];
