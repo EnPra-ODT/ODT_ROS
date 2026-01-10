@@ -148,6 +148,15 @@ include_directories(
 # target_link_libraries(${PROJECT_NAME}_node
 #   ${catkin_LIBRARIES}
 # )
+add_executable(multiple_pitch src/multiple_pitch.cpp)
+add_executable(pitch_driver src/pitch_driver.cpp)
+
+target_link_libraries(multiple_pitch
+  ${catkin_LIBRARIES}
+)
+target_link_libraries(pitch_driver
+  ${catkin_LIBRARIES}
+)
 
 #############
 ## Install ##
