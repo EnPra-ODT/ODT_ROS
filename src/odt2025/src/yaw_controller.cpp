@@ -238,7 +238,7 @@ static void rightCallback(const std_msgs::Float64MultiArray::ConstPtr& msg){
 
 static void footContactCallback(const std_msgs::Float64MultiArray::ConstPtr& msg){
   if (msg->data.size() < 4) {
-    ROS_WARN_THROTTLE(1.0, "foot_contact_array: expected 4 elements, got %zu", msg->data.size());
+    ROS_WARN_THROTTLE(1.0, "foot_contact_pair: expected 4 elements, got %zu", msg->data.size());
     return;
   }
 
@@ -274,7 +274,7 @@ int main(int argc, char **argv){
 
   std::string left_topic  = "/imu_data_left";
   std::string right_topic = "/imu_data_right";
-  std::string contact_topic = "/foot_contact_array";
+  std::string contact_topic = "/foot_contact_pair";
   std::string port = DEVICENAME;
 
   pnh.param<std::string>("left_topic", left_topic, left_topic);

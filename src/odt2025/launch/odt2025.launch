@@ -43,7 +43,7 @@
     <!-- Topics -->
     <param name="left_topic" value="/imu_data_left" />
     <param name="right_topic" value="/imu_data_right" />
-    <param name="contact_topic" value="/foot_contact_array" />
+    <param name="contact_topic" value="/foot_contact_pair" />
 
     <!-- Dynamixel -->
     <param name="port" value="/dev/ttyUSB0" />
@@ -66,4 +66,11 @@
     <param name="max_goal_tick" value="1048575" />
 
   </node>
+
+  <node pkg="odt2025" type="loadcell_node.py" name="loadcell_reader" output="screen">
+    <param name="port" value="/dev/ttyACM0" />
+    <param name="baud"  value="115200" />
+    <param name="threshold" value="10.0" />
+  </node>
+  
 </launch>
