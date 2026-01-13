@@ -324,9 +324,14 @@ int main(int argc, char **argv){
 
   // Configure all 4 Dynamixels
   for (int i = 0; i < kNumMotors; i++) {
+    disableTorque(g_ids[i]);
+  }
+  for (int i = 0; i < kNumMotors; i++) {
     setOperatingMode(g_ids[i], OPERATING_MODE_EXT_POS);
   }
-
+  for (int i = 0; i < kNumMotors; i++) {
+    enableTorque(g_ids[i]);
+  }
   // Base tick for each motor + initialize hold ticks = base ticks
   try {
     for (int i = 0; i < kNumMotors; i++) {
