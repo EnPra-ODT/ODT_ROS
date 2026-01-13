@@ -7,12 +7,6 @@ from std_msgs.msg import Float32, Bool, Float64MultiArray
 
 def main():
     rospy.init_node('loadcell_reader')
-    
-    start_time = rospy.Time.now()
-    OFFSET_DELAY = rospy.Duration(10.0)  # 10秒
-
-    offset_set = False
-
 
     # --- publishers ---
     pub_ch1 = rospy.Publisher('/loadcell_ch1', Float32, queue_size=10)
@@ -26,10 +20,10 @@ def main():
     
     #どれが接地しているのか
     
-    pub_contact_pair = rospy.Publisher(
-     '/foot_contact_pair',
-     Float64MultiArray,
-     queue_size=10
+    #pub_contact_pair = rospy.Publisher(
+     #'/foot_contact_pair',
+     #Float64MultiArray,
+     #queue_size=10
     ) 
     
         # 各ロードセルの接地状態を配列で送る
@@ -73,21 +67,6 @@ def main():
     while not rospy.is_shutdown():
         rospy.loginfo("loop alive")
         
-        #オフセット
-        now = rospy.Time.now()
-
-        if not offset_set and (now - start_time) > OFFSET_DELAY:
-            offset_ch1 = last_raw_ch1
-            offset_ch2 = last_raw_ch2
-            offset_ch3 = last_raw_ch3
-            offset_ch4 = last_raw_ch4
-            offset_ch5 = last_raw_ch5
-            offset_ch6 = last_raw_ch6
-            offset_ch7 = last_raw_ch7
-            offset_ch8 = last_raw_ch8
-
-            offset_set = True
-            rospy.loginfo("Offset automatically set after 10 seconds")
 
 
         # --- key input ---

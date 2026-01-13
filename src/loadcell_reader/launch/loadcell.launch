@@ -1,0 +1,17 @@
+<launch>
+
+  <!-- loadcell node -->
+  <node
+    pkg="loadcell_reader"
+    type="loadcell_node.py"
+    name="loadcell_reader"
+    output="screen">
+
+    <!-- パラメータ -->
+    <param name="port" value="/dev/ttyACM0" />
+    <param name="baud" value="115200" />
+    <param name="threshold" value="10.0" />
+
+  </node>
+
+</launch>
