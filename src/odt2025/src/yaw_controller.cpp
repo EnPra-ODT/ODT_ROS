@@ -244,7 +244,6 @@ static void footContactCallback(const std_msgs::Float64MultiArray::ConstPtr& msg
 
   g_have_contact = true;
 
-  // Update contact flags and detect rising edges (0->1) to capture hold ticks immediately
   for (int i = 0; i < kNumMotors; i++) {
     const bool new_contact = (msg->data[i] >= 0.5);
     const bool old_contact = g_contact[i];
@@ -252,14 +251,12 @@ static void footContactCallback(const std_msgs::Float64MultiArray::ConstPtr& msg
     g_contact_prev[i] = old_contact;
     g_contact[i] = new_contact;
 
-    // Rising edge: 0 -> 1 : capture present position as hold tick + immediately command it
     if (!old_contact && new_contact) {
       try {
         g_hold_tick[i] = readPresentPositionTicks(g_ids[i]);
         ROS_INFO("Contact rising on id=%d: freeze at tick=%d", g_ids[i], (int)g_hold_tick[i]);
       } catch (const std::exception& e) {
         ROS_ERROR("Contact rising on id=%d but readPresentPosition failed: %s", g_ids[i], e.what());
-        // fallback: hold base tick (not perfect, but prevents wild motion)
         g_hold_tick[i] = g_base_tick[i];
       }
     }
@@ -306,7 +303,7 @@ int main(int argc, char **argv){
 
   pnh.param<double>("min_cmd_period", g_min_cmd_period, 0.01);
 
-  // Init SDK
+  // Init Dynamixel
   portHandler = dynamixel::PortHandler::getPortHandler(port.c_str());
   packetHandler = dynamixel::PacketHandler::getPacketHandler(PROTOCOL_VERSION);
 
@@ -319,10 +316,7 @@ int main(int argc, char **argv){
     return 1;
   }
 
-  // Create GroupSyncWrite for Goal Position (4 bytes)
   g_syncWrite = new dynamixel::GroupSyncWrite(portHandler, packetHandler, ADDR_GOAL_POSITION, 4);
-
-  // Configure all 4 Dynamixels
   for (int i = 0; i < kNumMotors; i++) {
     disableTorque(g_ids[i]);
   }
@@ -332,7 +326,6 @@ int main(int argc, char **argv){
   for (int i = 0; i < kNumMotors; i++) {
     enableTorque(g_ids[i]);
   }
-  // Base tick for each motor + initialize hold ticks = base ticks
   try {
     for (int i = 0; i < kNumMotors; i++) {
       g_base_tick[i] = readPresentPositionTicks(g_ids[i]);
