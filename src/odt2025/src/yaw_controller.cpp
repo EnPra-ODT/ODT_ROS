@@ -1,236 +1,274 @@
+#include <iostream>
+#include <cmath>
+#include <string>
+#include <stdexcept>
+
 #include <ros/ros.h>
 #include <std_msgs/Float64MultiArray.h>
-#include <std_msgs/Float64.h>
 
-#include <cmath>
-#include <limits>
-#include <string>
+#include <dynamixel_sdk/dynamixel_sdk.h>
 
-struct AxisState {
-    int still_count = 0;
+// ---------------- Control table (XH540-W150-T, Protocol 2.0) ----------------
+#define ADDR_OPERATING_MODE     11
+#define ADDR_TORQUE_ENABLE      64
+#define ADDR_GOAL_POSITION      116
+#define ADDR_PRESENT_POSITION   132
 
-    double a_hat = 0.0;
-    double P_1d  = 1.0;
+#define PROTOCOL_VERSION        2.0
 
-    bool   has_light_prev = false;
-    double a_light_prev   = 0.0;
+// ---------------- Default settings ----------------
+#define DEVICENAME              "/dev/ttyUSB0"
+#define BAUDRATE                1000000
 
-    double v2 = 0.0;
-    double b2 = 0.0;
+// X-series: 4096 ticks / rev
+#define TICKS_PER_REV           4096.0
 
-    double P00 = 1.0, P01 = 0.0, P10 = 0.0, P11 = 1.0;
-};
+// Extended Position Control Mode
+#define OPERATING_MODE_EXT_POS  4
 
-class ImuKfLogger {
-public:
-    ImuKfLogger(ros::NodeHandle &nh) : nh_(nh)
-    {
-        nh_.param<std::string>("topic", topic_, std::string("/imu_data_left"));
+#define TORQUE_ENABLE           1
+#define TORQUE_DISABLE          0
 
-        nh_.param("deadband_x", deadband_x_, 0.15);
-        nh_.param("deadband_y", deadband_y_, 0.15);
-        nh_.param("deadband_z", deadband_z_, 0.30);
-        nh_.param("zupt_steps", zupt_steps_, 5);
+// Extended position range is commonly ±1048575 ticks (check your config)
+#define DEFAULT_MIN_GOAL_TICK   -1048575
+#define DEFAULT_MAX_GOAL_TICK    1048575
 
-        nh_.param("Q", Q_, 0.05);
-        nh_.param("R", R_, 0.20);
+// ---------------- Globals ----------------
+dynamixel::PortHandler *portHandler = nullptr;
+dynamixel::PacketHandler *packetHandler = nullptr;
 
-        nh_.param("lpf_alpha", lpf_alpha_, 0.3);
+static int g_dxl_id = 1;
 
-        nh_.param("q_v", q_v_, 0.5);
-        nh_.param("q_b", q_b_, 0.01);
-        nh_.param("r_zupt", r_zupt_, 1e-4);
+static bool g_zero_on_start = true;
+static bool g_have_angle0 = false;
+static double g_angle0_deg = 0.0;
 
-        nh_.param("dt_min", dt_min_, 0.001);
+static double g_angle_scale = 20.0;         // e.g., gear ratio / mapping gain
+static int32_t g_base_tick = 0;             // motor present position at start
+static int32_t g_goal_offset_ticks = 0;     // extra offset ticks
 
-        // MINIMAL FIX #1: 0.050 drops 10 Hz data (dt ~ 0.1s). Use a safer default.
-        nh_.param("dt_max", dt_max_, 0.20);
+static bool g_use_limits = true;
+static int32_t g_min_goal_tick = DEFAULT_MIN_GOAL_TICK;
+static int32_t g_max_goal_tick = DEFAULT_MAX_GOAL_TICK;
 
-        nh_.param<std::string>("out_topic", out_topic_, std::string("v_mag"));
-        vmag_pub_ = nh_.advertise<std_msgs::Float64>(out_topic_, 10);
+static double g_min_cmd_period = 0.01;      // seconds
+static ros::Time g_last_cmd_time(0);
 
-        sub_ = nh_.subscribe(topic_, 50, &ImuKfLogger::cb, this);
+// ---- left/right data state ----
+static bool g_have_left = false;
+static bool g_have_right = false;
+static double g_left_angle_deg = 0.0;
+static double g_right_angle_deg = 0.0;
 
-        last_msg_time_ = ros::Time(0);
+// ---------------- Helpers ----------------
+static inline int32_t clampI32(int32_t v, int32_t lo, int32_t hi) {
+  return std::max(lo, std::min(hi, v));
+}
 
-        watchdog_ = nh_.createTimer(
-            ros::Duration(1.0),
-            &ImuKfLogger::watchdogCb,
-            this
-        );
+// ---------------- Dynamixel functions ----------------
+static bool write1B(int id, int addr, uint8_t val) {
+  uint8_t dxl_error = 0;
+  int comm = packetHandler->write1ByteTxRx(portHandler, id, addr, val, &dxl_error);
+  if (comm != COMM_SUCCESS) {
+    ROS_ERROR("DXL write1B failed (id=%d addr=%d): %s", id, addr, packetHandler->getTxRxResult(comm));
+    return false;
+  }
+  if (dxl_error != 0) {
+    ROS_ERROR("DXL write1B error (id=%d addr=%d): %s", id, addr, packetHandler->getRxPacketError(dxl_error));
+    return false;
+  }
+  return true;
+}
 
-        ROS_INFO_STREAM("Subscribed to topic: " << topic_);
-        ROS_INFO_STREAM("Publishing Float64 on: " << out_topic_);
-    }
+static bool write4B(int id, int addr, uint32_t val) {
+  uint8_t dxl_error = 0;
+  int comm = packetHandler->write4ByteTxRx(portHandler, id, addr, val, &dxl_error);
+  if (comm != COMM_SUCCESS) {
+    ROS_ERROR("DXL write4B failed (id=%d addr=%d): %s", id, addr, packetHandler->getTxRxResult(comm));
+    return false;
+  }
+  if (dxl_error != 0) {
+    ROS_ERROR("DXL write4B error (id=%d addr=%d): %s", id, addr, packetHandler->getRxPacketError(dxl_error));
+    return false;
+  }
+  return true;
+}
 
-private:
-    void watchdogCb(const ros::TimerEvent &){
-        if (last_msg_time_.isZero()) {
-            ROS_WARN_THROTTLE(2.0, "No IMU messages received yet.");
-            return;
-        }
-        if ((ros::Time::now() - last_msg_time_).toSec() > 2.0) {
-            ROS_WARN_THROTTLE(2.0, "No IMU messages received in >2s.");
-        }
-    }
+static bool read4B(int id, int addr, uint32_t &out) {
+  uint8_t dxl_error = 0;
+  int comm = packetHandler->read4ByteTxRx(portHandler, id, addr, &out, &dxl_error);
+  if (comm != COMM_SUCCESS) {
+    ROS_ERROR("DXL read4B failed (id=%d addr=%d): %s", id, addr, packetHandler->getTxRxResult(comm));
+    return false;
+  }
+  if (dxl_error != 0) {
+    ROS_ERROR("DXL read4B error (id=%d addr=%d): %s", id, addr, packetHandler->getRxPacketError(dxl_error));
+    return false;
+  }
+  return true;
+}
 
-    void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
-        last_msg_time_ = ros::Time::now();
-        const auto &d = msg->data;
-        if (d.size() != 7) return;
+static void disableTorque(int id) {
+  write1B(id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE);
+}
 
-        double t_ms = d[0];
-        double ax   = d[1];
-        double ay   = d[2];
-        double az   = d[3];
+static void enableTorque(int id) {
+  write1B(id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE);
+}
 
-        if (!have_prev_time_) {
-            t_prev_ms_ = t_ms;
-            have_prev_time_ = true;
-            return;
-        }
+static void setOperatingMode(int id, uint8_t mode) {
+  // Must be torque OFF to change mode
+  disableTorque(id);
+  if (write1B(id, ADDR_OPERATING_MODE, mode)) {
+    ROS_INFO("DXL id=%d Operating Mode set to %d (4=Extended Position)", id, (int)mode);
+  }
+  enableTorque(id);
+}
 
-        // dt in seconds (assuming t_ms is milliseconds)
-        double dt = (t_ms - t_prev_ms_) * 1e-3;
+static int32_t readPresentPositionTicks(int id) {
+  uint32_t pos_u32 = 0;
+  if (!read4B(id, ADDR_PRESENT_POSITION, pos_u32)) {
+    throw std::runtime_error("Failed to read present position");
+  }
+  return (int32_t)pos_u32; // interpret as signed
+}
 
-        // MINIMAL FIX #2: if time goes backwards / stalls (wrap/reset), resync instead of killing output.
-        if (!(dt > 0.0)) {
-            ROS_WARN_THROTTLE(1.0, "Non-positive dt (t_ms reset/wrap?). Resyncing time.");
-            t_prev_ms_ = t_ms;
-            return;
-        }
+static void writeGoalPositionTicks(int id, int32_t goal_tick) {
+  write4B(id, ADDR_GOAL_POSITION, (uint32_t)goal_tick);
+}
 
-        t_prev_ms_ = t_ms;
+// ---------------- Command update ----------------
+static void trySendCommand()
+{
+  // Need both sides at least once
+  if (!g_have_left || !g_have_right) return;
 
-        if (dt < dt_min_ || dt > dt_max_) {
-            ROS_WARN_THROTTLE(1.0, "dt=%.6f rejected (min=%.6f max=%.6f). Increase dt_max or check t_ms units.",
-                              dt, dt_min_, dt_max_);
-            return;
-        }
+  const ros::Time now = ros::Time::now();
+  if ((now - g_last_cmd_time).toSec() < g_min_cmd_period) return;
+  g_last_cmd_time = now;
 
-        const double F00 = 1.0, F01 = -dt;
-        const double F10 = 0.0, F11 = 1.0;
+  // average angle (deg) from data[4]
+  const double target_deg = 0.5 * (g_left_angle_deg + g_right_angle_deg);
 
-        processAxis(x_, ax, deadband_x_, F00, F01, F10, F11, dt);
-        processAxis(y_, ay, deadband_y_, F00, F01, F10, F11, dt);
-        processAxis(z_, az, deadband_z_, F00, F01, F10, F11, dt);
+  // Optionally "zero" at start
+  if (g_zero_on_start && !g_have_angle0) {
+    g_angle0_deg = target_deg;
+    g_have_angle0 = true;
+    ROS_INFO("Captured angle0 = %.3f deg (from avg left/right data[4])", g_angle0_deg);
+    return;
+  }
 
-        const double vx = x_.v2;
-        const double vy = y_.v2;
-        const double vz = z_.v2;
+  const double ddeg = g_zero_on_start ? (target_deg - g_angle0_deg) : target_deg;
 
-        const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0; // cm/s
+  // Convert degrees -> ticks (multi-turn allowed)
+  const double ticks_per_deg = (TICKS_PER_REV / 360.0);
+  const double delta_ticks_d = g_angle_scale * ddeg * ticks_per_deg;
 
-        vmag_msg_.data = v_mag;
-        vmag_pub_.publish(vmag_msg_);
-    }
+  int32_t goal_tick = (int32_t)llround((double)g_base_tick + (double)g_goal_offset_ticks + delta_ticks_d);
 
-    double processAxis(AxisState &S, double a_in, double deadband,double F00, double F01, double F10, double F11, double dt){
-        // 1D accel KF
-        double z = a_in;
-        if (std::abs(z) < deadband) z = 0.0;
+  if (g_use_limits) {
+    goal_tick = clampI32(goal_tick, g_min_goal_tick, g_max_goal_tick);
+  }
 
-        S.P_1d += Q_;
-        double K = S.P_1d / (S.P_1d + R_);
-        S.a_hat += K * (z - S.a_hat);
-        S.P_1d  *= (1.0 - K);
+  writeGoalPositionTicks(g_dxl_id, goal_tick);
 
-        //Weak LPF
-        double a_light;
-        if (!S.has_light_prev) {
-            a_light = a_in;
-            S.has_light_prev = true;
-        } else {
-            a_light = lpf_alpha_ * S.a_light_prev + (1.0 - lpf_alpha_) * a_in;
-        }
-        S.a_light_prev = a_light;
+  ROS_INFO_THROTTLE(0.5,
+    "left=%.2f deg right=%.2f deg avg=%.2f deg d=%.2f deg -> goal_tick=%d",
+    g_left_angle_deg, g_right_angle_deg, target_deg, ddeg, (int)goal_tick);
+}
 
-        const double u = a_light;
+// ---------------- Subscribers ----------------
+static void leftCallback(const std_msgs::Float64MultiArray::ConstPtr& msg)
+{
+  if (msg->data.size() < 7) {
+    ROS_WARN_THROTTLE(1.0, "imu_data_left: expected >= 7 elements, got %zu", msg->data.size());
+    return;
+  }
+  g_left_angle_deg = msg->data[4];
+  g_have_left = true;
+  trySendCommand();
+}
 
-        // Stillness detection
-        if (std::abs(u) <= deadband) S.still_count++;
-        else S.still_count = 0;
+static void rightCallback(const std_msgs::Float64MultiArray::ConstPtr& msg)
+{
+  if (msg->data.size() < 7) {
+    ROS_WARN_THROTTLE(1.0, "imu_data_right: expected >= 7 elements, got %zu", msg->data.size());
+    return;
+  }
+  g_right_angle_deg = msg->data[4];
+  g_have_right = true;
+  trySendCommand();
+}
 
-        const bool still = (S.still_count >= zupt_steps_);
-
-        // Predict
-        S.v2 += (u - S.b2) * dt;
-
-        double A00 = F00 * S.P00 + F01 * S.P10;
-        double A01 = F00 * S.P01 + F01 * S.P11;
-        double A10 = F10 * S.P00 + F11 * S.P10;
-        double A11 = F10 * S.P01 + F11 * S.P11;
-
-        double P00p = A00 * F00 + A01 * F01 + q_v_ * dt * dt;
-        double P01p = A00 * F10 + A01 * F11;
-        double P10p = A10 * F00 + A11 * F01;
-        double P11p = A10 * F10 + A11 * F11 + q_b_ * dt;
-
-        S.P00 = P00p; S.P01 = P01p; S.P10 = P10p; S.P11 = P11p;
-
-        // ZUPT update
-        if (still) {
-            double y = -S.v2;
-            double Szz = S.P00 + r_zupt_;
-
-            double K0 = S.P00 / Szz;
-            double K1 = S.P10 / Szz;
-
-            // state update
-            S.v2 += K0 * y;
-            S.b2 += K1 * y;
-
-            // MINIMAL FIX #3: covariance update must use temporaries (avoid in-place dependency bugs)
-            const double P00_old = S.P00;
-            const double P01_old = S.P01;
-            const double P10_old = S.P10;
-            const double P11_old = S.P11;
-
-            const double P00_new = (1.0 - K0) * P00_old;
-            const double P01_new = (1.0 - K0) * P01_old;
-            const double P10_new = P10_old - K1 * P00_old;
-            const double P11_new = P11_old - K1 * P01_old;
-
-            S.P00 = P00_new;
-            S.P01 = P01_new;
-            S.P10 = P10_new;
-            S.P11 = P11_new;
-        }
-
-        return S.a_hat;
-    }
-
-private:
-    ros::NodeHandle nh_;
-    ros::Subscriber sub_;
-    ros::Publisher  vmag_pub_;
-    std_msgs::Float64 vmag_msg_;
-
-    ros::Timer watchdog_;
-    ros::Time last_msg_time_;
-
-    std::string topic_;
-    std::string out_topic_;
-
-    double deadband_x_, deadband_y_, deadband_z_;
-    int zupt_steps_;
-
-    double Q_, R_;
-    double lpf_alpha_;
-    double q_v_, q_b_, r_zupt_;
-    double dt_min_, dt_max_;
-
-    bool have_prev_time_ = false;
-    double t_prev_ms_ = 0.0;
-
-    AxisState x_, y_, z_;
-};
-
+// ---------------- main ----------------
 int main(int argc, char **argv){
-    ros::init(argc, argv, "imu_kf_logger");
-    ros::NodeHandle nh("~");
+  ros::init(argc, argv, "angleavg_to_dynamixel_extpos");
+  ros::NodeHandle nh;
+  ros::NodeHandle pnh("~");
 
-    ImuKfLogger node(nh);
-    ros::spin();
-    return 0;
+  std::string left_topic  = "/imu_data_left";
+  std::string right_topic = "/imu_data_right";
+  std::string port = DEVICENAME;
+
+  pnh.param<std::string>("left_topic", left_topic, left_topic);
+  pnh.param<std::string>("right_topic", right_topic, right_topic);
+  pnh.param<std::string>("port", port, port);
+
+  int baud = BAUDRATE;
+  pnh.param<int>("baud", baud, BAUDRATE);
+
+  pnh.param<int>("dxl_id", g_dxl_id, 1);
+
+  pnh.param<bool>("zero_on_start", g_zero_on_start, true);
+  pnh.param<double>("angle_scale", g_angle_scale, 20.0);
+  pnh.param<int>("goal_offset_ticks", g_goal_offset_ticks, 0);
+
+  pnh.param<bool>("use_limits", g_use_limits, true);
+  int min_goal_tick = DEFAULT_MIN_GOAL_TICK;
+  int max_goal_tick = DEFAULT_MAX_GOAL_TICK;
+  pnh.param<int>("min_goal_tick", min_goal_tick, DEFAULT_MIN_GOAL_TICK);
+  pnh.param<int>("max_goal_tick", max_goal_tick, DEFAULT_MAX_GOAL_TICK);
+  g_min_goal_tick = (int32_t)min_goal_tick;
+  g_max_goal_tick = (int32_t)max_goal_tick;
+
+  pnh.param<double>("min_cmd_period", g_min_cmd_period, 0.01);
+
+  // Init SDK
+  portHandler = dynamixel::PortHandler::getPortHandler(port.c_str());
+  packetHandler = dynamixel::PacketHandler::getPacketHandler(PROTOCOL_VERSION);
+
+  if (!portHandler->openPort()) {
+    ROS_ERROR("Failed to open port: %s", port.c_str());
+    return 1;
+  }
+  if (!portHandler->setBaudRate(baud)) {
+    ROS_ERROR("Failed to set baudrate: %d", baud);
+    return 1;
+  }
+
+  // Configure Dynamixel
+  setOperatingMode(g_dxl_id, OPERATING_MODE_EXT_POS);
+
+  // Base tick = current position
+  try {
+    g_base_tick = readPresentPositionTicks(g_dxl_id);
+    ROS_INFO("DXL present position (base_tick) = %d", (int)g_base_tick);
+  } catch (const std::exception& e) {
+    ROS_ERROR("Error reading present position: %s", e.what());
+    return 1;
+  }
+
+  ros::Subscriber subL = nh.subscribe(left_topic,  50, leftCallback);
+  ros::Subscriber subR = nh.subscribe(right_topic, 50, rightCallback);
+
+  ROS_INFO("angleavg_to_dynamixel_extpos running.");
+  ROS_INFO("Left topic : %s", left_topic.c_str());
+  ROS_INFO("Right topic: %s", right_topic.c_str());
+  ROS_INFO("DXL: id=%d port=%s baud=%d mode=ExtendedPosition(4)", g_dxl_id, port.c_str(), baud);
+
+  ros::spin();
+
+  disableTorque(g_dxl_id);
+  portHandler->closePort();
+  return 0;
 }

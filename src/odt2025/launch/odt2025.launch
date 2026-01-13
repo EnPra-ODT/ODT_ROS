@@ -1,6 +1,6 @@
 <launch>
   <!-- Left -->
-  <node pkg="odt2025" type="imu_kf_logger" name="imu_kf_left" output="screen">
+  <node pkg="odt2025" type="velocity_calculator" name="imu_kf_left" output="screen">
     <param name="topic" value="/imu_data_left" />
     <param name="out_topic" value="/v_mag_left" />
 
@@ -20,7 +20,7 @@
   </node>
 
   <!-- RIGHT -->
-  <node pkg="odt2025" type="imu_kf_logger" name="imu_kf_right" output="screen">
+  <node pkg="odt2025" type="velocity_calculator" name="imu_kf_right" output="screen">
     <param name="topic" value="/imu_data_right" />
     <param name="out_topic" value="/v_mag_right" />
 
