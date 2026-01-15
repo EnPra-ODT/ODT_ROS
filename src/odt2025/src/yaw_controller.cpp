@@ -56,6 +56,10 @@ static int32_t g_max_goal_tick = DEFAULT_MAX_GOAL_TICK;
 static double g_min_cmd_period = 0.01;      // seconds
 static ros::Time g_last_cmd_time(0);
 
+static std::array<int32_t, kNumMotors> g_last_goal_tick = {0, 0, 0, 0};
+static bool g_have_last_goal = false;
+
+
 // ---- left/right data state ----
 static bool g_have_left = false;
 static bool g_have_right = false;
@@ -206,6 +210,8 @@ static void trySendCommand(){
     goal_ticks[i] = goal;
   }
 
+  g_last_goal_tick = goal_ticks;
+  g_have_last_goal = true;
   syncWriteGoalPositions(goal_ticks);
 
   ROS_INFO_THROTTLE(0.5,
@@ -252,15 +258,20 @@ static void footContactCallback(const std_msgs::Float64MultiArray::ConstPtr& msg
     g_contact[i] = new_contact;
 
     if (!old_contact && new_contact) {
-      try {
-        g_hold_tick[i] = readPresentPositionTicks(g_ids[i]);
-        ROS_INFO("Contact rising on id=%d: freeze at tick=%d", g_ids[i], (int)g_hold_tick[i]);
-      } catch (const std::exception& e) {
-        ROS_ERROR("Contact rising on id=%d but readPresentPosition failed: %s", g_ids[i], e.what());
+      // Freeze at the last commanded GOAL, not the current position
+      if (g_have_last_goal) {
+        g_hold_tick[i] = g_last_goal_tick[i];
+        ROS_INFO("Contact rising on id=%d: freeze at LAST GOAL tick=%d", g_ids[i], (int)g_hold_tick[i]);
+      } else {
+        // If contact happens before first command, fall back to base tick
         g_hold_tick[i] = g_base_tick[i];
+        ROS_WARN("Contact rising on id=%d but no last goal yet; freeze at base_tick=%d", g_ids[i], (int)g_hold_tick[i]);
       }
     }
+
+
   }
+  g_last_cmd_time = ros::Time(0);
   trySendCommand();
 }
 
