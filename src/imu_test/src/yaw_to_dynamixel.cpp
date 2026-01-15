@@ -59,7 +59,7 @@ static double g_yaw_unwrapped_deg = 0.0;
 // ---------------- Helpers ----------------
 static inline double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 
-static inline int32_t clampI32(int32_t v, int32_t lo, int32_t hi) {
+static inline int32_t clampInt32(int32_t v, int32_t lo, int32_t hi) {
   return std::max(lo, std::min(hi, v));
 }
 
@@ -211,7 +211,7 @@ static void imuCallback(const sensor_msgs::Imu::ConstPtr& msg)
   int32_t goal_tick = (int32_t)llround((double)g_base_tick + (double)g_goal_offset_ticks + delta_ticks_d);
 
   if (g_use_limits) {
-    goal_tick = clampI32(goal_tick, g_min_goal_tick, g_max_goal_tick);
+    goal_tick = clampInt32(goal_tick, g_min_goal_tick, g_max_goal_tick);
   }
 
   writeGoalPositionTicks(g_dxl_id, goal_tick);
