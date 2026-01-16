@@ -6,6 +6,8 @@
 #include <limits>
 #include <string>
 
+float g_prev_RPY[3] = {0.0f};
+
 struct AxisState {
     int still_count = 0;
 
@@ -49,6 +51,9 @@ public:
         nh_.param<std::string>("out_topic", out_topic_, std::string("v_mag"));
         vmag_pub_ = nh_.advertise<std_msgs::Float64>(out_topic_, 10);
 
+        nh_.param<std::string>("out_topic_RPY", out_topic_RPY_, std::string("deltaRPY"));
+        deltaRPY_pub_ = nh.advertise<std_msgs::Float64>(out_topic_RPY_,10);
+
         sub_ = nh_.subscribe(topic_, 50, &ImuKfLogger::cb, this);
 
         last_msg_time_ = ros::Time(0);
@@ -74,6 +79,19 @@ private:
         }
     }
 
+    float calcDeltaRPY(float* current_angle_array, float* prev_angle_array){
+        float deltaRoll = std::abs(current_angle_array[0] - prev_angle_array[0]);
+        float deltaPitch = std::abs(current_angle_array[0] - prev_angle_array[0]);
+        float deltaYaw = std::abs(current_angle_array[0] - prev_angle_array[0]);
+
+        prev_angle_array[0] = current_angle_array[0];
+        prev_angle_array[1] = current_angle_array[1];
+        prev_angle_array[2] = current_angle_array[2];
+
+        float deltaRPY = deltaRoll + deltaPitch + deltaYaw;
+        return deltaRPY;
+    }
+
     void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
         last_msg_time_ = ros::Time::now();
         const auto &d = msg->data;
@@ -83,6 +101,7 @@ private:
         double ax   = d[1];
         double ay   = d[2];
         double az   = d[3];
+        float current_angle[3] = {static_cast<float>d[4], static_cast<float>d[5], static_cast<float>d[6]};
 
         if (!have_prev_time_) {
             t_prev_ms_ = t_ms;
@@ -103,8 +122,7 @@ private:
         t_prev_ms_ = t_ms;
 
         if (dt < dt_min_ || dt > dt_max_) {
-            ROS_WARN_THROTTLE(1.0, "dt=%.6f rejected (min=%.6f max=%.6f). Increase dt_max or check t_ms units.",
-                              dt, dt_min_, dt_max_);
+            ROS_WARN_THROTTLE(1.0, "dt=%.6f rejected (min=%.6f max=%.6f). Increase dt_max or check t_ms units.",dt, dt_min_, dt_max_);
             return;
         }
 
@@ -120,9 +138,12 @@ private:
         const double vz = z_.v2;
 
         const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0; // cm/s
+        const float deltaRPY = calcDeltaRPY(&current_angle, &g_prev_RPY);
 
         vmag_msg_.data = v_mag;
         vmag_pub_.publish(vmag_msg_);
+        deltaRPY_msg_.data = deltaRPY;
+        deltaRPY_pub_.publish(deltaRPY_msg_);
     }
 
     double processAxis(AxisState &S, double a_in, double deadband,double F00, double F01, double F10, double F11, double dt){
@@ -204,13 +225,16 @@ private:
     ros::NodeHandle nh_;
     ros::Subscriber sub_;
     ros::Publisher  vmag_pub_;
+    ros::Publisher deltaRPY_pub_
     std_msgs::Float64 vmag_msg_;
+    std_msgs::Float64 deltaRPY_msg_;
 
     ros::Timer watchdog_;
     ros::Time last_msg_time_;
 
     std::string topic_;
     std::string out_topic_;
+    std::string out_topic_RPY_;
 
     double deadband_x_, deadband_y_, deadband_z_;
     int zupt_steps_;
