@@ -44,9 +44,10 @@ public:
         nh_.param("r_zupt", r_zupt_, 1e-4);
 
         nh_.param("dt_min", dt_min_, 0.001);
-
-        // MINIMAL FIX #1: 0.050 drops 10 Hz data (dt ~ 0.1s). Use a safer default.
         nh_.param("dt_max", dt_max_, 0.20);
+
+        nh_.param("rpy_zupt_thresh_deg", rpy_zupt_thresh_deg_, 3.0);
+
 
         nh_.param<std::string>("out_topic", out_topic_, std::string("v_mag"));
         vmag_pub_ = nh_.advertise<std_msgs::Float64>(out_topic_, 10);
@@ -78,17 +79,23 @@ private:
             ROS_WARN_THROTTLE(2.0, "No IMU messages received in >2s.");
         }
     }
+    static inline float wrapDiffDeg(float cur, float prev){
+        float d = cur - prev;
+        while (d >  180.0f) d -= 360.0f;
+        while (d < -180.0f) d += 360.0f;
+        return d;
+    }
 
-    float calcDeltaRPY(const float* current_angle_array, float* prev_angle_array){
-        float deltaRoll = std::abs(current_angle_array[0] - prev_angle_array[0]);
-        float deltaPitch = std::abs(current_angle_array[1] - prev_angle_array[1]);
-        float deltaYaw = std::abs(current_angle_array[2] - prev_angle_array[2]);
+    float calcDeltaRPY(const float* cur, float* prev){
+        const float deltaRoll  = wrapDiffDeg(cur[0], prev[0]);
+        const float deltaPitch = wrapDiffDeg(cur[1], prev[1]);
+        const float deltaYaw   = wrapDiffDeg(cur[2], prev[2]);
 
-        prev_angle_array[0] = current_angle_array[0];
-        prev_angle_array[1] = current_angle_array[1];
-        prev_angle_array[2] = current_angle_array[2];
+        prev[0] = cur[0];
+        prev[1] = cur[1];
+        prev[2] = cur[2];
 
-        return deltaRoll + deltaPitch + deltaYaw;
+        return std::fabs(deltaRoll) + std::fabs(deltaPitch) + std::fabs(deltaYaw);
     }
 
     void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
@@ -102,47 +109,42 @@ private:
         double az   = d[3];
         float current_angle[3] = {static_cast<float>(d[4]), static_cast<float>(d[5]), static_cast<float>(d[6])};
 
-        if (!have_prev_time_) {
-            t_prev_ms_ = t_ms;
-            have_prev_time_ = true;
-            return;
-        }
-        double dt = (t_ms - t_prev_ms_) * 1e-3;
-        if (!(dt > 0.0)) {
-            ROS_WARN_THROTTLE(1.0, "Non-positive dt (t_ms reset/wrap?). Resyncing time.");
-            t_prev_ms_ = t_ms;
-            return;
-        }
-
-        t_prev_ms_ = t_ms;
-
-        if (dt < dt_min_ || dt > dt_max_) {
-            ROS_WARN_THROTTLE(1.0, "dt=%.6f rejected (min=%.6f max=%.6f). Increase dt_max or check t_ms units.",dt, dt_min_, dt_max_);
-            return;
+        // --- deltaRPY (deg) ---
+        float deltaRPY = 0.0f;
+        if (!have_prev_rpy_) {
+            // initialize previous angles on first message
+            g_prev_RPY[0] = current_angle[0];
+            g_prev_RPY[1] = current_angle[1];
+            g_prev_RPY[2] = current_angle[2];
+            have_prev_rpy_ = true;
+            deltaRPY = 0.0f;
+        } else {
+            deltaRPY = calcDeltaRPY(current_angle, g_prev_RPY);
         }
 
-        const double F00 = 1.0, F01 = -dt;
-        const double F10 = 0.0, F11 = 1.0;
+        // --- Stillness detection using deltaRPY ---
+        if (deltaRPY <= static_cast<float>(rpy_zupt_thresh_deg_)) rpy_still_count_++;
+        else rpy_still_count_ = 0;
 
-        processAxis(x_, ax, deadband_x_, F00, F01, F10, F11, dt);
-        processAxis(y_, ay, deadband_y_, F00, F01, F10, F11, dt);
-        processAxis(z_, az, deadband_z_, F00, F01, F10, F11, dt);
+        const bool still = (rpy_still_count_ >= zupt_steps_);
+
+        processAxis(x_, ax, deadband_x_, F00, F01, F10, F11, dt, still);
+        processAxis(y_, ay, deadband_y_, F00, F01, F10, F11, dt, still);
+        processAxis(z_, az, deadband_z_, F00, F01, F10, F11, dt, still);
 
         const double vx = x_.v2;
         const double vy = y_.v2;
         const double vz = z_.v2;
-
         const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0; // cm/s
-        const float deltaRPY = calcDeltaRPY(current_angle, g_prev_RPY);
 
         vmag_msg_.data = v_mag;
         vmag_pub_.publish(vmag_msg_);
         deltaRPY_msg_.data = deltaRPY;
         deltaRPY_pub_.publish(deltaRPY_msg_);
+
     }
 
-    double processAxis(AxisState &S, double a_in, double deadband,double F00, double F01, double F10, double F11, double dt){
-        // 1D accel KF
+    double processAxis(AxisState &S, double a_in, double deadband, double F00, double F01, double F10, double F11, double dt, bool still){
         double z = a_in;
         if (std::abs(z) < deadband) z = 0.0;
 
@@ -151,7 +153,6 @@ private:
         S.a_hat += K * (z - S.a_hat);
         S.P_1d  *= (1.0 - K);
 
-        //Weak LPF
         double a_light;
         if (!S.has_light_prev) {
             a_light = a_in;
@@ -163,13 +164,7 @@ private:
 
         const double u = a_light;
 
-        // Stillness detection
-        if (std::abs(u) <= deadband) S.still_count++;
-        else S.still_count = 0;
-
         const bool still = (S.still_count >= zupt_steps_);
-
-        // Predict
         S.v2 += (u - S.b2) * dt;
 
         double A00 = F00 * S.P00 + F01 * S.P10;
@@ -192,11 +187,9 @@ private:
             double K0 = S.P00 / Szz;
             double K1 = S.P10 / Szz;
 
-            // state update
             S.v2 += K0 * y;
             S.b2 += K1 * y;
 
-            // MINIMAL FIX #3: covariance update must use temporaries (avoid in-place dependency bugs)
             const double P00_old = S.P00;
             const double P01_old = S.P01;
             const double P10_old = S.P10;
@@ -241,6 +234,11 @@ private:
 
     bool have_prev_time_ = false;
     double t_prev_ms_ = 0.0;
+
+    double rpy_zupt_thresh_deg_ = 3.0;  // still if deltaRPY <= this
+    int    rpy_still_count_ = 0;
+    bool   have_prev_rpy_ = false;
+
 
     AxisState x_, y_, z_;
 };
