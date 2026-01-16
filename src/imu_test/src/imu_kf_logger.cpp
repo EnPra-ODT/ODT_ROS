@@ -79,17 +79,16 @@ private:
         }
     }
 
-    float calcDeltaRPY(float* current_angle_array, float* prev_angle_array){
+    float calcDeltaRPY(const float* current_angle_array, float* prev_angle_array){
         float deltaRoll = std::abs(current_angle_array[0] - prev_angle_array[0]);
-        float deltaPitch = std::abs(current_angle_array[0] - prev_angle_array[0]);
-        float deltaYaw = std::abs(current_angle_array[0] - prev_angle_array[0]);
+        float deltaPitch = std::abs(current_angle_array[1] - prev_angle_array[1]);
+        float deltaYaw = std::abs(current_angle_array[2] - prev_angle_array[2]);
 
         prev_angle_array[0] = current_angle_array[0];
         prev_angle_array[1] = current_angle_array[1];
         prev_angle_array[2] = current_angle_array[2];
 
-        float deltaRPY = deltaRoll + deltaPitch + deltaYaw;
-        return deltaRPY;
+        return deltaRoll + deltaPitch + deltaYaw;
     }
 
     void cb(const std_msgs::Float64MultiArray::ConstPtr &msg){
@@ -101,18 +100,14 @@ private:
         double ax   = d[1];
         double ay   = d[2];
         double az   = d[3];
-        float current_angle[3] = {static_cast<float>d[4], static_cast<float>d[5], static_cast<float>d[6]};
+        float current_angle[3] = {static_cast<float>(d[4]), static_cast<float>(d[5]), static_cast<float>(d[6])};
 
         if (!have_prev_time_) {
             t_prev_ms_ = t_ms;
             have_prev_time_ = true;
             return;
         }
-
-        // dt in seconds (assuming t_ms is milliseconds)
         double dt = (t_ms - t_prev_ms_) * 1e-3;
-
-        // MINIMAL FIX #2: if time goes backwards / stalls (wrap/reset), resync instead of killing output.
         if (!(dt > 0.0)) {
             ROS_WARN_THROTTLE(1.0, "Non-positive dt (t_ms reset/wrap?). Resyncing time.");
             t_prev_ms_ = t_ms;
@@ -138,7 +133,7 @@ private:
         const double vz = z_.v2;
 
         const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0; // cm/s
-        const float deltaRPY = calcDeltaRPY(&current_angle, &g_prev_RPY);
+        const float deltaRPY = calcDeltaRPY(current_angle, g_prev_RPY);
 
         vmag_msg_.data = v_mag;
         vmag_pub_.publish(vmag_msg_);
@@ -225,7 +220,7 @@ private:
     ros::NodeHandle nh_;
     ros::Subscriber sub_;
     ros::Publisher  vmag_pub_;
-    ros::Publisher deltaRPY_pub_
+    ros::Publisher deltaRPY_pub_;
     std_msgs::Float64 vmag_msg_;
     std_msgs::Float64 deltaRPY_msg_;
 
