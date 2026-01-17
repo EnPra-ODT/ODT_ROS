@@ -3,6 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
 
 #include <ros/ros.h>
 #include <std_msgs/Float64MultiArray.h>
