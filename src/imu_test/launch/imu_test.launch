@@ -16,8 +16,8 @@
     <param name="q_b" value="0.01" />
     <param name="r_zupt" value="1e-4" />
     <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.10" />
-    <param name="rpy_zupt_thresh_deg" value="3.0" />
+    <param name="dt_max" value="0.15" />
+    <param name="rpy_zupt_thresh_deg" value="5.0" />
   </node>
 
   <!-- RIGHT -->
@@ -36,7 +36,7 @@
     <param name="q_b" value="0.01" />
     <param name="r_zupt" value="1e-4" />
     <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.10" />
-    <param name="rpy_zupt_thresh_deg" value="3.0" />
+    <param name="dt_max" value="0.15" />
+    <param name="rpy_zupt_thresh_deg" value="5.0" />
   </node>
 </launch>
