@@ -25,8 +25,7 @@ struct AxisState {
 
 class ImuKfLogger {
 public:
-    ImuKfLogger(ros::NodeHandle &nh) : nh_(nh)
-    {
+    ImuKfLogger(ros::NodeHandle &nh) : nh_(nh){
         nh_.param<std::string>("topic", topic_, std::string("/imu_data_left"));
 
         nh_.param("deadband_x", deadband_x_, 0.15);
