@@ -66,7 +66,8 @@ public:
         );
 
         ROS_INFO_STREAM("Subscribed to topic: " << topic_);
-        ROS_INFO_STREAM("Publishing Float64 on: " << out_topic_);
+        ROS_INFO_STREAM("Publishing velocity on: " << out_topic_);
+        ROS_INFO_STREAM("Publishing detltaRPY on :" << out_topic_RPY_);
     }
 
 private:

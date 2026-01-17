@@ -1,49 +1,76 @@
 <launch>
-  <!-- Left -->
-  <node pkg="imu_test" type="imu_kf_logger" name="imu_kf_left" output="screen">
+  <!-- IMU Left -->
+  <node pkg="odt2025" type="velocity_calculator" name="imu_kf_left" output="screen">
     <param name="topic" value="/imu_data_left" />
     <param name="out_topic" value="/v_mag_left" />
-    <param name="out_topic_RPY" value="/deltaRPY_left" />
 
-    <!-- LEFT -->
     <param name="deadband_x" value="0.15" />
     <param name="deadband_y" value="0.15" />
     <param name="deadband_z" value="0.30" />
     <param name="zupt_steps" value="5" />
-
     <param name="Q" value="0.05" />
     <param name="R" value="0.20" />
     <param name="lpf_alpha" value="0.3" />
-
     <param name="q_v" value="0.5" />
     <param name="q_b" value="0.01" />
     <param name="r_zupt" value="1e-4" />
-
     <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.20" />
+    <param name="dt_max" value="0.10" />
   </node>
 
-  <!-- Right -->
-  <node pkg="imu_test" type="imu_kf_logger" name="imu_kf_right" output="screen">
+  <!-- IMU RIGHT -->
+  <node pkg="odt2025" type="velocity_calculator" name="imu_kf_right" output="screen">
     <param name="topic" value="/imu_data_right" />
     <param name="out_topic" value="/v_mag_right" />
-    <param name="out_topic_RPY" value="/deltaRPY_right" />
 
-    <!-- RIGHT -->
     <param name="deadband_x" value="0.15" />
     <param name="deadband_y" value="0.15" />
     <param name="deadband_z" value="0.28" />
     <param name="zupt_steps" value="5" />
-
     <param name="Q" value="0.05" />
     <param name="R" value="0.20" />
     <param name="lpf_alpha" value="0.3" />
-
     <param name="q_v" value="0.5" />
     <param name="q_b" value="0.01" />
     <param name="r_zupt" value="1e-4" />
-
     <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.20" />
+    <param name="dt_max" value="0.10" />
   </node>
+
+  <!-- Yaw Controller -->
+  <node pkg="odt2025" type="yaw_controller" name="yaw_controller" output="screen">
+
+    <!-- Topics -->
+    <param name="left_topic" value="/imu_data_left" />
+    <param name="right_topic" value="/imu_data_right" />
+    <param name="contact_topic" value="/foot_contact_pair" />
+
+    <!-- Dynamixel -->
+    <param name="port" value="/dev/ttyUSB0" />
+    <param name="baud" value="1000000" />
+
+    <!-- Control -->
+    <param name="zero_on_start" value="true" />
+    <param name="angle_scale" value="20.0" />
+    <param name="min_cmd_period" value="0.01" />
+
+    <!-- Per-motor offsets (ID 1~4) -->
+    <param name="goal_offset_ticks_1" value="0" />
+    <param name="goal_offset_ticks_2" value="0" />
+    <param name="goal_offset_ticks_3" value="0" />
+    <param name="goal_offset_ticks_4" value="0" />
+
+    <!-- Limits -->
+    <param name="use_limits" value="true" />
+    <param name="min_goal_tick" value="-1048575" />
+    <param name="max_goal_tick" value="1048575" />
+
+  </node>
+
+  <node pkg="odt2025" type="loadcell_node.py" name="loadcell_reader" output="screen">
+    <param name="port" value="/dev/ttyACM0" />
+    <param name="baud"  value="115200" />
+    <param name="threshold" value="10.0" />
+  </node>
+  
 </launch>

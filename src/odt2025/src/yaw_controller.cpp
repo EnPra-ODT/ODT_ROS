@@ -67,7 +67,7 @@ static std::array<int32_t,kNumMotors>  g_hold_tick = {0, 0, 0, 0};
 static bool g_have_last_goal = false;
 static std::array<int32_t, kNumMotors> g_last_goal_tick = {0, 0, 0, 0};
 
-// ---------------- Bit Encoder ---------------- //
+// -------------------- Bit Encoder & Sender -------------------- //
 static inline int32_t clampInt32(int32_t v, int32_t lo, int32_t hi) {
   return std::max(lo, std::min(hi, v));
 }
@@ -80,7 +80,6 @@ static inline void packInt32LE(int32_t v, uint8_t out[4]) {
   out[3] = static_cast<uint8_t>((u >> 24) & 0xFF);
 }
 
-// ---------------- Dynamixel Update ---------------- //
 static bool write1B(int id, int addr, uint8_t val) {
   uint8_t dxl_error = 0;
   int comm = g_pkt->write1ByteTxRx(g_port, id, addr, val, &dxl_error);
@@ -109,6 +108,7 @@ static bool read4B(int id, int addr, uint32_t &out) {
   return true;
 }
 
+// ------------------- Dynamixel Functions ------------------- //
 static void setTorque(int id, bool on) {
   write1B(id, ADDR_TORQUE_ENABLE, on ? TORQUE_ENABLE : TORQUE_DISABLE);
 }
@@ -226,7 +226,6 @@ static void footContactCallback(const std_msgs::Float64MultiArray::ConstPtr& msg
 
   g_have_contact = true;
 
-  // Update contact flags; on rising edge, freeze at last commanded GOAL
   for (int i = 0; i < kNumMotors; i++) {
     const bool new_contact = (msg->data[i] >= 0.5);
     const bool old_contact = g_contact[i];
@@ -243,7 +242,6 @@ static void footContactCallback(const std_msgs::Float64MultiArray::ConstPtr& msg
     }
   }
 
-  // Force immediate command update on contact change
   g_last_cmd_time = ros::Time(0);
   trySendCommand();
 }
