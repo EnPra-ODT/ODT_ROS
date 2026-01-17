@@ -11,10 +11,16 @@ float g_prev_RPY[3] = {0.0f};
 
 struct AxisState {
     int still_count = 0;
-    bool   has_lpf_prev = false;
-    double a_lpf_prev   = 0.0;
+
+    double a_hat = 0.0;
+    double P_1d  = 1.0;
+
+    bool   has_light_prev = false;
+    double a_light_prev   = 0.0;
+
     double v2 = 0.0;
     double b2 = 0.0;
+
     double P00 = 1.0, P01 = 0.0, P10 = 0.0, P11 = 1.0;
 };
 
@@ -27,12 +33,21 @@ public:
         nh_.param("deadband_y", deadband_y_, 0.15);
         nh_.param("deadband_z", deadband_z_, 0.30);
         nh_.param("zupt_steps", zupt_steps_, 5);
+
+        nh_.param("Q", Q_, 0.05);
+        nh_.param("R", R_, 0.20);
+
         nh_.param("lpf_alpha", lpf_alpha_, 0.3);
+
         nh_.param("q_v", q_v_, 0.5);
         nh_.param("q_b", q_b_, 0.01);
         nh_.param("r_zupt", r_zupt_, 1e-4);
+
         nh_.param("dt_min", dt_min_, 0.001);
         nh_.param("dt_max", dt_max_, 0.20);
+
+        nh_.param("rpy_zupt_thresh_deg", rpy_zupt_thresh_deg_, 3.0);
+
 
         nh_.param<std::string>("out_topic", out_topic_, std::string("v_mag"));
         vmag_pub_ = nh_.advertise<std_msgs::Float64>(out_topic_, 10);
@@ -43,10 +58,15 @@ public:
         sub_ = nh_.subscribe(topic_, 50, &ImuKfLogger::cb, this);
 
         last_msg_time_ = ros::Time(0);
-        watchdog_ = nh_.createTimer(ros::Duration(1.0), &ImuKfLogger::watchdogCb, this);
+
+        watchdog_ = nh_.createTimer(
+            ros::Duration(1.0),
+            &ImuKfLogger::watchdogCb,
+            this
+        );
 
         ROS_INFO_STREAM("Subscribed to topic: " << topic_);
-        ROS_INFO_STREAM("Publishing Float64 on: " << out_topic_);
+        ROS_INFO_STREAM("Publishing velocity on: " << out_topic_);
         ROS_INFO_STREAM("Publishing detltaRPY on :" << out_topic_RPY_);
     }
 
@@ -60,7 +80,6 @@ private:
             ROS_WARN_THROTTLE(2.0, "No IMU messages received in >2s.");
         }
     }
-
     static inline float wrapDiffDeg(float cur, float prev){
         float d = cur - prev;
         while (d >  180.0f) d -= 360.0f;
@@ -89,35 +108,43 @@ private:
         const double ax   = d[1];
         const double ay   = d[2];
         const double az   = d[3];
-        const float current_angle[3] = { static_cast<float>(d[4]), static_cast<float>(d[5]), static_cast<float>(d[6])};
 
+        const float current_angle[3] = {
+            static_cast<float>(d[4]),
+            static_cast<float>(d[5]),
+            static_cast<float>(d[6])
+        };
+
+        // ---- dt + state transition terms ----
         if (!have_prev_time_) {
+            t_prev_ms_ = t_ms;
+            have_prev_time_ = true;
+
+            // also init RPY prev
             g_prev_RPY[0] = current_angle[0];
             g_prev_RPY[1] = current_angle[1];
             g_prev_RPY[2] = current_angle[2];
-            t_prev_ms_ = t_ms;
-            have_prev_time_ = true;
             have_prev_rpy_ = true;
             return;
         }
 
-        double dt = (t_ms - t_prev_ms_) * 1e-3;
+        const double dt = (t_ms - t_prev_ms_) * 1e-3;
         if (!(dt > 0.0)) {
             ROS_WARN_THROTTLE(1.0, "Non-positive dt (t_ms reset/wrap?). Resyncing time.");
             t_prev_ms_ = t_ms;
             return;
         }
-
         t_prev_ms_ = t_ms;
 
         if (dt < dt_min_ || dt > dt_max_) {
-            ROS_WARN_THROTTLE(1.0, "dt=%.6f rejected (min=%.6f max=%.6f). Increase dt_max or check t_ms units.", dt, dt_min_, dt_max_);
+            ROS_WARN_THROTTLE(1.0, "dt=%.6f rejected (min=%.6f max=%.6f).", dt, dt_min_, dt_max_);
             return;
         }
 
         const double F00 = 1.0, F01 = -dt;
-        const double F10 = 0.0, F11 = 1.0;
+        const double F10 = 0.0, F11 =  1.0;
 
+        // ---- deltaRPY + global stillness ----
         float deltaRPY = 0.0f;
         if (!have_prev_rpy_) {
             g_prev_RPY[0] = current_angle[0];
@@ -134,15 +161,15 @@ private:
 
         const bool still_global = (rpy_still_count_ >= zupt_steps_);
 
-        processAxis(x_, ax, deadband_x_, F00, F01, F10, F11, dt);
-        processAxis(y_, ay, deadband_y_, F00, F01, F10, F11, dt);
-        processAxis(z_, az, deadband_z_, F00, F01, F10, F11, dt);
+        // ---- filtering + integration ----
+        processAxis(x_, ax, deadband_x_, F00, F01, F10, F11, dt, still_global);
+        processAxis(y_, ay, deadband_y_, F00, F01, F10, F11, dt, still_global);
+        processAxis(z_, az, deadband_z_, F00, F01, F10, F11, dt, still_global);
 
         const double vx = x_.v2;
         const double vy = y_.v2;
         const double vz = z_.v2;
         const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0; // cm/s
-
 
         vmag_msg_.data = v_mag;
         vmag_pub_.publish(vmag_msg_);
@@ -150,7 +177,9 @@ private:
         deltaRPY_pub_.publish(deltaRPY_msg_);
     }
 
+
     double processAxis(AxisState &S, double a_in, double deadband, double F00, double F01, double F10, double F11, double dt, bool still_global){
+        // 1D accel KF (optional output: S.a_hat)
         double z = a_in;
         if (std::abs(z) < deadband) z = 0.0;
 
@@ -210,6 +239,7 @@ private:
 
         return S.a_hat;
     }
+
 
 private:
     ros::NodeHandle nh_;
