@@ -179,7 +179,6 @@ private:
 
 
     double processAxis(AxisState &S, double a_in, double deadband, double F00, double F01, double F10, double F11, double dt, bool still_global){
-        // 1D accel KF (optional output: S.a_hat)
         double z = a_in;
         if (std::abs(z) < deadband) z = 0.0;
 
@@ -188,7 +187,7 @@ private:
         S.a_hat += K * (z - S.a_hat);
         S.P_1d  *= (1.0 - K);
 
-        // Weak LPF on raw accel (your input to integration)
+        //LPF
         double a_light;
         if (!S.has_light_prev) {
             a_light = a_in;
@@ -200,7 +199,6 @@ private:
 
         const double u = a_light;
 
-        // Predict
         S.v2 += (u - S.b2) * dt;
 
         const double A00 = F00 * S.P00 + F01 * S.P10;
@@ -215,7 +213,6 @@ private:
 
         S.P00 = P00p; S.P01 = P01p; S.P10 = P10p; S.P11 = P11p;
 
-        // ZUPT update using global stillness flag
         if (still_global) {
             const double y = -S.v2;
             const double Szz = S.P00 + r_zupt_;
@@ -267,7 +264,7 @@ private:
     bool have_prev_time_ = false;
     double t_prev_ms_ = 0.0;
 
-    double rpy_zupt_thresh_deg_ = 3.0;  // still if deltaRPY <= this
+    double rpy_zupt_thresh_deg_ = 3.0;
     int    rpy_still_count_ = 0;
     bool   have_prev_rpy_ = false;
 
