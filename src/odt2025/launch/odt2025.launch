@@ -1,45 +1,100 @@
 <launch>
-  <!-- IMU Left -->
-  <node pkg="odt2025" type="velocity_calculator" name="imu_kf_left" output="screen">
-    <param name="topic" value="/imu_data_left" />
-    <param name="out_topic" value="/v_mag_left" />
 
-    <param name="deadband_x" value="0.15" />
-    <param name="deadband_y" value="0.15" />
-    <param name="deadband_z" value="0.30" />
-    <param name="zupt_steps" value="5" />
-    <param name="Q" value="0.05" />
-    <param name="R" value="0.20" />
-    <param name="lpf_alpha" value="0.3" />
-    <param name="q_v" value="0.5" />
-    <param name="q_b" value="0.01" />
-    <param name="r_zupt" value="1e-4" />
-    <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.10" />
-    <param name="rpy_zupt_thresh_deg" value="5.0" />
+<!-- ============================================================
+      Dual IMU velocity fusion node
+      - Subscribes:  /imu_data_left, /imu_data_right
+      - Publishes:   /v_mag_left, /v_mag_right, /v_mag_active
+      ============================================================ -->
+  <node pkg="odt2025" type="velocity_calculator_dual" name="imu_kf_dual" output="screen">
+
+    <!-- Active (fused) output tuning -->
+    <param name="active_stale_sec"   value="0.20" />
+    <param name="move_thresh_deg"    value="1.0" />
+    <param name="alpha_up"           value="0.7" />
+    <param name="alpha_down"         value="0.05" />
+    <param name="max_drop_cms_per_s" value="200.0" />
+    <!-- 0 = MAX(vL,vR), 1 = deltaRPY-weighted blend -->
+    <param name="fuse_mode"          value="0" />
+
+    <!-- LEFT channel params -->
+    <group ns="left">
+      <param name="topic"            value="/imu_data_left" />
+      <param name="out_topic"        value="/v_mag_left" />
+      <param name="out_topic_RPY"    value="/deltaRPY_left" />
+
+      <param name="deadband_x" value="0.15" />
+      <param name="deadband_y" value="0.15" />
+      <param name="deadband_z" value="0.30" />
+      <param name="zupt_steps" value="5" />
+      <param name="Q" value="0.05" />
+      <param name="R" value="0.20" />
+      <param name="lpf_alpha" value="0.3" />
+      <param name="q_v" value="0.5" />
+      <param name="q_b" value="0.01" />
+      <param name="r_zupt" value="1e-4" />
+      <param name="dt_min" value="0.001" />
+      <param name="dt_max" value="0.10" />
+      <param name="rpy_zupt_thresh_deg" value="5.0" />
+    </group>
+
+    <!-- RIGHT channel params -->
+    <group ns="right">
+      <param name="topic"            value="/imu_data_right" />
+      <param name="out_topic"        value="/v_mag_right" />
+      <param name="out_topic_RPY"    value="/deltaRPY_right" />
+
+      <param name="deadband_x" value="0.15" />
+      <param name="deadband_y" value="0.15" />
+      <param name="deadband_z" value="0.28" />
+      <param name="zupt_steps" value="5" />
+      <param name="Q" value="0.05" />
+      <param name="R" value="0.20" />
+      <param name="lpf_alpha" value="0.3" />
+      <param name="q_v" value="0.5" />
+      <param name="q_b" value="0.01" />
+      <param name="r_zupt" value="1e-4" />
+      <param name="dt_min" value="0.001" />
+      <param name="dt_max" value="0.10" />
+      <param name="rpy_zupt_thresh_deg" value="5.0" />
+    </group>
+
   </node>
 
-  <!-- IMU RIGHT -->
-  <node pkg="odt2025" type="velocity_calculator" name="imu_kf_right" output="screen">
-    <param name="topic" value="/imu_data_right" />
-    <param name="out_topic" value="/v_mag_right" />
 
-    <param name="deadband_x" value="0.15" />
-    <param name="deadband_y" value="0.15" />
-    <param name="deadband_z" value="0.28" />
-    <param name="zupt_steps" value="5" />
-    <param name="Q" value="0.05" />
-    <param name="R" value="0.20" />
-    <param name="lpf_alpha" value="0.3" />
-    <param name="q_v" value="0.5" />
-    <param name="q_b" value="0.01" />
-    <param name="r_zupt" value="1e-4" />
-    <param name="dt_min" value="0.001" />
-    <param name="dt_max" value="0.10" />
-    <param name="rpy_zupt_thresh_deg" value="5.0" />
+  <!-- ============================================================
+       Kinco CANopen speed node
+       - Subscribes:  /v_mag_active  (cm/s)
+       - Commands:    all node_ids in Profile Velocity mode
+       - Roller dia:  4 cm, gear ratio: 10:1 (motor:roller)
+       ============================================================ -->
+  <node pkg="odt2025" type="kinco_from_vmag_active" name="kinco_speed" output="screen">
+
+    <param name="can_iface"          value="can0" />
+    <param name="speed_topic"        value="/v_mag_active" />
+
+    <!-- Motor + mechanism -->
+    <param name="roller_diameter_m"  value="0.04" />
+    <param name="gear_ratio"         value="10.0" />
+    <param name="encoder_res"        value="65536" />
+    <param name="max_rpm"            value="5000" />
+
+    <!-- Command behavior -->
+    <param name="cmd_refresh_hz"     value="50.0" />
+    <param name="speed_scale"        value="0.01" />   <!-- cm/s -> m/s -->
+    <param name="max_cmd_cms"        value="300.0" />  <!-- safety clamp; set <=0 to disable -->
+    <param name="enable_on_start"    value="true" />
+
+    <!-- Optional feedback -->
+    <param name="enable_feedback"    value="false" />
+    <param name="poll_hz"            value="10.0" />
+    <param name="feedback_topic"     value="/kinco/actual_rpm" />
+
+    <!-- Your Kinco node IDs -->
+    <rosparam param="node_ids">[1,2,3,4]</rosparam>
   </node>
 
-  <!-- Yaw Controller -->
+
+  <!-- Yaw Controller (unchanged) -->
   <node pkg="odt2025" type="yaw_controller" name="yaw_controller" output="screen">
 
     <!-- Topics -->
@@ -66,13 +121,14 @@
     <param name="use_limits" value="true" />
     <param name="min_goal_tick" value="-1048575" />
     <param name="max_goal_tick" value="1048575" />
-
   </node>
 
+
+  <!-- Loadcell reader (unchanged) -->
   <node pkg="odt2025" type="loadcell_node.py" name="loadcell_reader" output="screen">
     <param name="port" value="/dev/ttyACM0" />
     <param name="baud"  value="115200" />
     <param name="threshold" value="10.0" />
   </node>
-  
+
 </launch>

@@ -105,9 +105,6 @@ private:
 
         ros::Time last_msg_time;
 
-        ros::Time last_active_pub_time_;
-        bool have_active_time_ = false;
-
         // Filter params (per channel)
         double deadband_x = 0.15, deadband_y = 0.15, deadband_z = 0.30;
         int    zupt_steps = 5;
@@ -143,6 +140,7 @@ private:
 
     void loadChannelParams(ros::NodeHandle& nhc, Channel& C, const std::string& label){
         C.label = label;
+
 
         nhc.param<std::string>("topic", C.topic, std::string("/imu_data_" + label));
         nhc.param<std::string>("out_topic", C.out_topic_vmag, std::string("/v_mag_" + label));
@@ -256,8 +254,8 @@ private:
         double v_next = v_active_out_ + a * (v_meas - v_active_out_);
 
         // Optional safety: limit maximum decel rate (prevents sudden drop)
-        if (max_drop_cms_per_s_ > 0.0 && dt > 1e-6) {
-            const double max_drop = max_drop_cms_per_s_ * dt;
+        if (max_drop_cms_per_s_ > 0.0 && dt_active > 1e-6) {
+            const double max_drop = max_drop_cms_per_s_ * dt_active;
             if (v_next < v_active_out_ - max_drop) v_next = v_active_out_ - max_drop;
         }
 
@@ -438,6 +436,10 @@ private:
 
     // Mode: 0 = MAX, 1 = deltaRPY-weighted blend
     int fuse_mode_ = 0;
+
+    ros::Time last_active_pub_time_;
+    bool have_active_time_ = false;
+
 };
 
 int main(int argc, char** argv){
