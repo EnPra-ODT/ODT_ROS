@@ -85,6 +85,14 @@ public:
   CanSocketBus(const CanSocketBus&) = delete;
   CanSocketBus& operator=(const CanSocketBus&) = delete;
 
+  void sendNmt(uint8_t cmd, uint8_t node_id){
+  // NMT is standard CAN frame, COB-ID 0x000, DLC=2
+  uint8_t data[8] = {0};
+  data[0] = cmd;     // 0x01=start, 0x02=stop, 0x80=pre-op, 0x81=reset node
+  data[1] = node_id; // 0 = all nodes, or specific node id
+  sendFrame(0x000, data);
+}
+
   void sendFrame(uint32_t can_id, const uint8_t data[8]) {
     std::lock_guard<std::mutex> lk(mtx_);
     struct can_frame frame;
@@ -233,18 +241,29 @@ public:
   int nodeId() const { return sdo_.nodeId(); }
 
   void initProfileVelocityMode() {
+    // Ensure node is operational first if you added NMT start
+    // (NMT is sent from outside; ok either way)
+
+    // Go to Shutdown
     sdo_.writeU16(0x6040, 0x00, CW_SHUTDOWN);
     ros::Duration(0.05).sleep();
+
+    // Set mode BEFORE enabling operation
+    sdo_.writeI8(0x6060, 0x00, 3); // Profile Velocity
+    ros::Duration(0.05).sleep();
+
+    // Zero target
+    sdo_.writeI32(0x60FF, 0x00, 0);
+    ros::Duration(0.05).sleep();
+
+    // Now do state transitions
     sdo_.writeU16(0x6040, 0x00, CW_SWITCH_ON);
     ros::Duration(0.05).sleep();
-    sdo_.writeI8 (0x6060, 0x00, 3);          // Profile Velocity
-    ros::Duration(0.05).sleep();
-    sdo_.writeI32(0x60FF, 0x00, 0);          // target vel = 0
-    ros::Duration(0.05).sleep();
+
     sdo_.writeU16(0x6040, 0x00, CW_ENABLE_OPERATION);
     ros::Duration(0.05).sleep();
 
-    ROS_INFO("Node %d: Profile Velocity enabled (target=0).", nodeId());
+    ROS_INFO("Node %d: Profile Velocity enabled (6060=3).", nodeId());
   }
 
   // Input RPM is MOTOR RPM (after gear ratio)
@@ -367,6 +386,9 @@ int main(int argc, char** argv) {
     kinco::CanSocketBus bus(can_iface);
 
     // ----- Motors -----
+    bus.sendNmt(0x01, (uint8_t)id);     // Start Remote Node
+    ros::Duration(0.05).sleep();
+
     std::vector<std::unique_ptr<kinco::KincoMotor>> motors;
     motors.reserve(node_ids.size());
 
