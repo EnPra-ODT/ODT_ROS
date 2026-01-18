@@ -27,3 +27,7 @@ add_dependencies(yaw_controller ${catkin_EXPORTED_TARGETS})
 add_executable(velocity_calculator src/velocity_calculator.cpp)
 target_link_libraries(velocity_calculator ${catkin_LIBRARIES})
 add_dependencies(velocity_calculator ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+
+add_executable(imu_controller src/imu_controller.cpp)
+target_link_libraries(imu_controller ${catkin_LIBRARIES})
+add_dependencies(imu_controller ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
