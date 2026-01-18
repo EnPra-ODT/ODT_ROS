@@ -146,7 +146,7 @@ private:
         nhc.param("deadband_x", C.deadband_x, 0.15);
         nhc.param("deadband_y", C.deadband_y, 0.15);
         nhc.param("deadband_z", C.deadband_z, 0.30);
-        nhc.param("zupt_steps", C.zupt_steps, 5);
+        nhc.param("zupt_steps", C.zupt_steps, 3);
 
         nhc.param("Q", C.Q, 0.05);
         nhc.param("R", C.R, 0.20);
