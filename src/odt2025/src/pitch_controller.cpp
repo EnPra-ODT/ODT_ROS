@@ -5,10 +5,6 @@
 //
 // Converts: cm/s -> m/s -> roller RPM (roller dia) -> motor RPM (gear ratio) -> drive units -> 0x60FF
 //
-// Notes:
-// - /v_mag_active is speed magnitude, so this code commands positive velocity only.
-// - Uses a timer to refresh commands at cmd_refresh_hz (avoids blocking CAN writes in callbacks).
-//
 // Params (~):
 //   can_iface            (string)  default "can0"
 //   node_ids             (list)    default [1]
@@ -22,10 +18,10 @@
 //   max_cmd_cms          (double)  default 300.0 (safety clamp; set <=0 to disable)
 //   enable_on_start      (bool)    default true
 //
-// Optional feedback (polling actual rpm):
+// Optional feedback:
 //   enable_feedback      (bool)    default false
 //   poll_hz              (double)  default 10.0
-//   feedback_topic       (string)  default "/kinco/actual_rpm"  (publishes average RPM across motors)
+//   feedback_topic       (string)  default "/kinco/actual_rpm"
 
 #include <ros/ros.h>
 #include <std_msgs/Float64.h>
@@ -48,15 +44,15 @@
 #include <errno.h>
 
 #include <net/if.h>
-
 #include <linux/can.h>
 #include <linux/can/raw.h>
+
+#include <xmlrpcpp/XmlRpcValue.h>
 
 // ================= Controlword (0x6040) =================
 constexpr uint16_t CW_SHUTDOWN         = 0x0006;
 constexpr uint16_t CW_SWITCH_ON        = 0x0007;
 constexpr uint16_t CW_ENABLE_OPERATION = 0x000F;
-constexpr uint16_t CW_FAULT_RESET      = 0x0080;
 // ========================================================
 
 namespace kinco {
@@ -66,9 +62,9 @@ struct MotorConfig {
   int max_rpm = 5000;
 
   double roller_diameter_m = 0.04; // 4 cm roller diameter
-  double gear_ratio = 10.0;        // motor:roller = 10:1 (motor RPM = roller RPM * 10)
+  double gear_ratio = 10.0;        // motor:roller = 10:1
 
-  // Kinco scaling constants (kept as in your code)
+  // Kinco scaling constants (as in your original code)
   double scale_num = 512.0 * 65536.0; // 512 * encoder_res
   double scale_den = 1875.0;
 
@@ -85,21 +81,14 @@ public:
   CanSocketBus(const CanSocketBus&) = delete;
   CanSocketBus& operator=(const CanSocketBus&) = delete;
 
-  void sendNmt(uint8_t cmd, uint8_t node_id){
-  // NMT is standard CAN frame, COB-ID 0x000, DLC=2
-  uint8_t data[8] = {0};
-  data[0] = cmd;     // 0x01=start, 0x02=stop, 0x80=pre-op, 0x81=reset node
-  data[1] = node_id; // 0 = all nodes, or specific node id
-  sendFrame(0x000, data);
-}
-
-  void sendFrame(uint32_t can_id, const uint8_t data[8]) {
+  // Generic send with custom DLC
+  void sendFrameDlc(uint32_t can_id, const uint8_t* data, uint8_t dlc) {
     std::lock_guard<std::mutex> lk(mtx_);
     struct can_frame frame;
     std::memset(&frame, 0, sizeof(frame));
-    frame.can_id = can_id;
-    frame.can_dlc = 8;
-    std::memcpy(frame.data, data, 8);
+    frame.can_id  = can_id;
+    frame.can_dlc = dlc;
+    if (dlc > 0) std::memcpy(frame.data, data, dlc);
 
     int n = ::write(sock_, &frame, sizeof(frame));
     if (n != (int)sizeof(frame)) {
@@ -107,6 +96,19 @@ public:
       oss << "CAN write failed (n=" << n << " errno=" << errno << ")";
       throw std::runtime_error(oss.str());
     }
+  }
+
+  // SDO always DLC=8
+  void sendFrame8(uint32_t can_id, const uint8_t data[8]) {
+    sendFrameDlc(can_id, data, 8);
+  }
+
+  // NMT: COB-ID 0x000, DLC=2
+  void sendNmt(uint8_t cmd, uint8_t node_id) {
+    uint8_t data[2];
+    data[0] = cmd;     // 0x01=start, 0x02=stop, 0x80=pre-op, 0x81=reset node
+    data[1] = node_id; // 0 = all nodes or specific node
+    sendFrameDlc(0x000, data, 2);
   }
 
   bool recvFrame(struct can_frame* out, int timeout_ms) {
@@ -187,7 +189,7 @@ public:
     req[1] = (uint8_t)(index & 0xFF);
     req[2] = (uint8_t)((index >> 8) & 0xFF);
     req[3] = sub;
-    bus_.sendFrame(req_cob, req);
+    bus_.sendFrame8(req_cob, req);
 
     const ros::Time end = ros::Time::now() + ros::Duration(window_ms / 1000.0);
     while (ros::Time::now() < end && ros::ok()) {
@@ -226,7 +228,7 @@ private:
     data[2] = (uint8_t)((index >> 8) & 0xFF);
     data[3] = sub;
     for (int i = 0; i < data_len && i < 4; i++) data[4 + i] = data_bytes[i];
-    bus_.sendFrame(cob_id, data);
+    bus_.sendFrame8(cob_id, data);
   }
 };
 
@@ -241,22 +243,19 @@ public:
   int nodeId() const { return sdo_.nodeId(); }
 
   void initProfileVelocityMode() {
-    // Ensure node is operational first if you added NMT start
-    // (NMT is sent from outside; ok either way)
-
-    // Go to Shutdown
+    // Shutdown first
     sdo_.writeU16(0x6040, 0x00, CW_SHUTDOWN);
     ros::Duration(0.05).sleep();
 
-    // Set mode BEFORE enabling operation
-    sdo_.writeI8(0x6060, 0x00, 3); // Profile Velocity
+    // Set mode (Profile Velocity = 3)
+    sdo_.writeI8(0x6060, 0x00, 3);
     ros::Duration(0.05).sleep();
 
-    // Zero target
+    // Target velocity = 0
     sdo_.writeI32(0x60FF, 0x00, 0);
     ros::Duration(0.05).sleep();
 
-    // Now do state transitions
+    // Switch on + enable op
     sdo_.writeU16(0x6040, 0x00, CW_SWITCH_ON);
     ros::Duration(0.05).sleep();
 
@@ -266,18 +265,7 @@ public:
     ROS_INFO("Node %d: Profile Velocity enabled (6060=3).", nodeId());
   }
 
-  // Input RPM is MOTOR RPM (after gear ratio)
-  void setTargetRpm(double rpm) {
-    if (!std::isfinite(rpm)) rpm = 0.0;
-    rpm = std::max(- (double)cfg_.max_rpm, std::min((double)cfg_.max_rpm, rpm));
-
-    const int32_t dec = rpmToDriveUnits(rpm);
-    sdo_.writeI32(0x60FF, 0x00, dec);
-  }
-
-  // Input linear speed is roller linear speed (m/s)
-  // This converts to MOTOR rpm by applying gear_ratio, then writes drive units.
-  void setTargetLinearMs(double v_ms) { setTargetRpm(msToMotorRpm(v_ms)); }
+  void setTargetLinearMs(double roller_v_ms) { setTargetRpm(msToMotorRpm(roller_v_ms)); }
 
   bool readActualRpm(double* out_motor_rpm, int window_ms = 20) {
     int32_t dec_val = 0;
@@ -286,18 +274,23 @@ public:
     return true;
   }
 
-  // For your conversion chain: m/s -> roller rpm -> motor rpm
-  double msToMotorRpm(double v_ms) const {
-    const double circ = M_PI * cfg_.roller_diameter_m;
-    if (circ <= 0.0) return 0.0;
-
-    const double roller_rpm = (v_ms / circ) * 60.0;
-    return roller_rpm * cfg_.gear_ratio; // <-- your "multiply by 10" happens here
-  }
-
 private:
   mutable MotorConfig cfg_;
   SdoClient sdo_;
+
+  void setTargetRpm(double motor_rpm) {
+    if (!std::isfinite(motor_rpm)) motor_rpm = 0.0;
+    motor_rpm = std::max(-(double)cfg_.max_rpm, std::min((double)cfg_.max_rpm, motor_rpm));
+    const int32_t dec = rpmToDriveUnits(motor_rpm);
+    sdo_.writeI32(0x60FF, 0x00, dec);
+  }
+
+  double msToMotorRpm(double roller_v_ms) const {
+    const double circ = M_PI * cfg_.roller_diameter_m;
+    if (circ <= 0.0) return 0.0;
+    const double roller_rpm = (roller_v_ms / circ) * 60.0;
+    return roller_rpm * cfg_.gear_ratio; // <-- your multiply-by-10
+  }
 
   int32_t rpmToDriveUnits(double motor_rpm) const {
     const double dec_f = motor_rpm * cfg_.scale_num / cfg_.scale_den;
@@ -319,13 +312,12 @@ static std::vector<int> getNodeIdsParam(ros::NodeHandle& pnh) {
     ids.push_back(1);
     return ids;
   }
-  if (v.getType() != XmlRpc::XmlRpcValue::TypeArray) {
+  if (v.getType() != XmlRpc::XmlRpcValue::TypeArray)
     throw std::runtime_error("~node_ids must be a list, e.g. [1,2,3]");
-  }
+
   for (int i = 0; i < v.size(); i++) {
-    if (v[i].getType() != XmlRpc::XmlRpcValue::TypeInt) {
+    if (v[i].getType() != XmlRpc::XmlRpcValue::TypeInt)
       throw std::runtime_error("~node_ids must contain ints");
-    }
     ids.push_back((int)v[i]);
   }
   if (ids.empty()) ids.push_back(1);
@@ -345,7 +337,6 @@ int main(int argc, char** argv) {
   ros::NodeHandle pnh("~");
 
   try {
-    // ----- Params -----
     std::string can_iface;
     pnh.param<std::string>("can_iface", can_iface, std::string("can0"));
 
@@ -376,8 +367,8 @@ int main(int argc, char** argv) {
     kinco::MotorConfig cfg;
     pnh.param<int>("encoder_res", cfg.encoder_res, cfg.encoder_res);
     pnh.param<int>("max_rpm", cfg.max_rpm, cfg.max_rpm);
-    pnh.param<double>("roller_diameter_m", cfg.roller_diameter_m, cfg.roller_diameter_m); // 0.04
-    pnh.param<double>("gear_ratio", cfg.gear_ratio, cfg.gear_ratio);                       // 10.0
+    pnh.param<double>("roller_diameter_m", cfg.roller_diameter_m, cfg.roller_diameter_m);
+    pnh.param<double>("gear_ratio", cfg.gear_ratio, cfg.gear_ratio);
     cfg.normalize();
 
     const auto node_ids = getNodeIdsParam(pnh);
@@ -385,16 +376,17 @@ int main(int argc, char** argv) {
     // ----- CAN bus -----
     kinco::CanSocketBus bus(can_iface);
 
-    // ----- Motors -----
-    bus.sendNmt(0x01, (uint8_t)id);     // Start Remote Node
+    // Put all nodes into OPERATIONAL
+    for (int id : node_ids) {
+      bus.sendNmt(0x01, (uint8_t)id);
+      ros::Duration(0.01).sleep();
+    }
     ros::Duration(0.05).sleep();
 
+    // ----- Motors -----
     std::vector<std::unique_ptr<kinco::KincoMotor>> motors;
     motors.reserve(node_ids.size());
-
-    for (int id : node_ids) {
-      motors.emplace_back(std::make_unique<kinco::KincoMotor>(bus, id, cfg));
-    }
+    for (int id : node_ids) motors.emplace_back(std::make_unique<kinco::KincoMotor>(bus, id, cfg));
 
     if (enable_on_start) {
       for (auto& m : motors) {
@@ -403,7 +395,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    // ----- Command input (from /v_mag_active) -----
+    // ----- Speed input -----
     std::mutex cmd_mtx;
     double latest_v_cms = 0.0;
     bool have_cmd = false;
@@ -417,7 +409,7 @@ int main(int argc, char** argv) {
       }
     );
 
-    // ----- Command timer: apply to all motors -----
+    // ----- Command timer -----
     ros::Timer cmd_timer = nh.createTimer(
       ros::Duration(1.0 / cmd_refresh_hz),
       [&](const ros::TimerEvent&){
@@ -430,20 +422,14 @@ int main(int argc, char** argv) {
         }
         if (!have) return;
 
-        // sanitize + clamp (cm/s)
         v_cms_local = clampNonNegFinite(v_cms_local, max_cmd_cms, enable_max_cmd);
+        const double roller_v_ms = v_cms_local * speed_scale;
 
-        // convert to m/s for the roller linear speed
-        const double v_ms = v_cms_local * speed_scale; // default 0.01
-
-        // send to each motor
-        for (auto& m : motors) {
-          m->setTargetLinearMs(v_ms);
-        }
+        for (auto& m : motors) m->setTargetLinearMs(roller_v_ms);
       }
     );
 
-    // ----- Optional feedback: publish average motor RPM -----
+    // ----- Optional feedback -----
     ros::Publisher fb_pub;
     ros::Timer fb_timer;
 
