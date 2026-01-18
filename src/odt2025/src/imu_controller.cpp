@@ -5,6 +5,7 @@
 #include <boost/bind.hpp>
 #include <cmath>
 #include <string>
+#include <algorithm>
 
 // ----------------- Per-axis state -----------------
 struct AxisState {
@@ -53,12 +54,15 @@ public:
         loadChannelParams(rnh, right_, "right");
 
         // Active-selection params (node-level)
-        pnh_.param("active_stale_sec",  active_stale_sec_,  0.20);
-        pnh_.param("move_thresh_deg",   move_thresh_deg_,   1.0);
-        pnh_.param("switch_margin_deg", switch_margin_deg_, 0.5);
-        pnh_.param("switch_hold_steps", switch_hold_steps_, 3);
+        pnh_.param("active_stale_sec",   active_stale_sec_,   0.20);
+        pnh_.param("move_thresh_deg",    move_thresh_deg_,    1.0);
+        pnh_.param("alpha_up",           alpha_up_,           0.7);
+        pnh_.param("alpha_down",         alpha_down_,         0.05);
+        pnh_.param("max_drop_cms_per_s", max_drop_cms_per_s_, 200.0);
+        pnh_.param("fuse_mode",          fuse_mode_,          0);
 
         active_vmag_pub_ = pnh_.advertise<std_msgs::Float64>("/v_mag_active", 10);
+
 
         left_.sub = pnh_.subscribe<std_msgs::Float64MultiArray>(
             left_.topic, 50,
@@ -101,6 +105,9 @@ private:
 
         ros::Time last_msg_time;
 
+        ros::Time last_active_pub_time_;
+        bool have_active_time_ = false;
+
         // Filter params (per channel)
         double deadband_x = 0.15, deadband_y = 0.15, deadband_z = 0.30;
         int    zupt_steps = 5;
@@ -133,8 +140,6 @@ private:
         double   vmag = 0.0;       // cm/s
         double   delta_rpy = 0.0;  // deg-sum
     };
-
-    enum class ActiveSide { NONE=0, LEFT=1, RIGHT=2 };
 
     void loadChannelParams(ros::NodeHandle& nhc, Channel& C, const std::string& label){
         C.label = label;
@@ -183,7 +188,18 @@ private:
     }
 
     // ---------- Active selection ----------
-    void publishActive(){
+    void publishActive(double dt){
+        double dt_active = dt;
+        if (!have_active_time_) {
+            last_active_pub_time_ = ros::Time::now();
+            have_active_time_ = true;
+            dt_active = dt; // fallback
+        } else {
+            dt_active = (ros::Time::now() - last_active_pub_time_).toSec();
+            last_active_pub_time_ = ros::Time::now();
+            if (dt_active <= 1e-6) dt_active = dt;
+        }
+
         const ros::Time now = ros::Time::now();
 
         auto isFresh = [&](const Channel& C){
@@ -194,84 +210,61 @@ private:
         const bool Lfresh = isFresh(left_);
         const bool Rfresh = isFresh(right_);
 
-        if (Lfresh && !Rfresh) {
-            active_side_ = ActiveSide::LEFT;
-            active_vmag_msg_.data = left_.vmag;
-            active_vmag_pub_.publish(active_vmag_msg_);
-            return;
-        }
-        if (!Lfresh && Rfresh) {
-            active_side_ = ActiveSide::RIGHT;
-            active_vmag_msg_.data = right_.vmag;
-            active_vmag_pub_.publish(active_vmag_msg_);
-            return;
-        }
+        // If neither fresh: decay output toward 0 safely
         if (!Lfresh && !Rfresh) {
-            active_side_ = ActiveSide::NONE;
-            active_vmag_msg_.data = 0.0;
+            const double v_meas = 0.0;
+            const double a = (v_meas > v_active_out_) ? alpha_up_ : alpha_down_;
+            v_active_out_ += a * (v_meas - v_active_out_);
+            active_vmag_msg_.data = v_active_out_;
             active_vmag_pub_.publish(active_vmag_msg_);
             return;
         }
 
-        const bool Lmoving = (left_.delta_rpy  >= move_thresh_deg_);
-        const bool Rmoving = (right_.delta_rpy >= move_thresh_deg_);
+        // If only one fresh: use only that one (still smoothed)
+        double vL = Lfresh ? left_.vmag  : 0.0;
+        double vR = Rfresh ? right_.vmag : 0.0;
 
-        if (Lmoving && !Rmoving) {
-            requestSwitch(ActiveSide::LEFT);
-            publishCurrentActive();
-            return;
-        }
-        if (!Lmoving && Rmoving) {
-            requestSwitch(ActiveSide::RIGHT);
-            publishCurrentActive();
-            return;
-        }
+        double dL = Lfresh ? left_.delta_rpy  : 0.0;
+        double dR = Rfresh ? right_.delta_rpy : 0.0;
 
-        if (!Lmoving && !Rmoving) {
-            if (active_side_ == ActiveSide::NONE) active_side_ = ActiveSide::LEFT;
-            publishCurrentActive();
-            return;
-        }
+        const bool Lmoving = (dL >= move_thresh_deg_);
+        const bool Rmoving = (dR >= move_thresh_deg_);
 
-        // Both moving: deltaRPY wins; tie-break with vmag
-        const double dL = left_.delta_rpy;
-        const double dR = right_.delta_rpy;
+        // If neither moving (per deltaRPY): target 0
+        double v_meas = 0.0;
 
-        ActiveSide winner;
-        if (std::fabs(dL - dR) >= switch_margin_deg_) {
-            winner = (dL > dR) ? ActiveSide::LEFT : ActiveSide::RIGHT;
+        if (Lmoving || Rmoving) {
+            if (fuse_mode_ == 0) {
+                // Mode 0: MAX (strongly prevents dip during foot transitions)
+                v_meas = std::max(vL, vR);
+            } else {
+                // Mode 1: deltaRPY-weighted blend (continuous)
+                // subtract threshold so near-threshold noise contributes less
+                const double wL_raw = std::max(0.0, dL - move_thresh_deg_);
+                const double wR_raw = std::max(0.0, dR - move_thresh_deg_);
+                const double sum = wL_raw + wR_raw + 1e-9;
+
+                const double wL = wL_raw / sum;
+                v_meas = wL * vL + (1.0 - wL) * vR;
+            }
         } else {
-            winner = (left_.vmag >= right_.vmag) ? ActiveSide::LEFT : ActiveSide::RIGHT;
+            v_meas = 0.0;
         }
 
-        requestSwitch(winner);
-        publishCurrentActive();
-    }
+        // Envelope follower: fast rise, slow fall
+        const double a = (v_meas > v_active_out_) ? alpha_up_ : alpha_down_;
+        double v_next = v_active_out_ + a * (v_meas - v_active_out_);
 
-    void publishCurrentActive(){
-        if (active_side_ == ActiveSide::RIGHT) active_vmag_msg_.data = right_.vmag;
-        else {
-            if (active_side_ == ActiveSide::NONE) active_side_ = ActiveSide::LEFT;
-            active_vmag_msg_.data = left_.vmag;
+        // Optional safety: limit maximum decel rate (prevents sudden drop)
+        if (max_drop_cms_per_s_ > 0.0 && dt > 1e-6) {
+            const double max_drop = max_drop_cms_per_s_ * dt;
+            if (v_next < v_active_out_ - max_drop) v_next = v_active_out_ - max_drop;
         }
+
+        v_active_out_ = v_next;
+
+        active_vmag_msg_.data = v_active_out_;
         active_vmag_pub_.publish(active_vmag_msg_);
-    }
-
-    void requestSwitch(ActiveSide desired){
-        if (active_side_ == ActiveSide::NONE) {
-            active_side_ = desired;
-            switch_count_ = 0;
-            return;
-        }
-        if (desired == active_side_) {
-            switch_count_ = 0;
-            return;
-        }
-        switch_count_++;
-        if (switch_count_ >= switch_hold_steps_) {
-            active_side_ = desired;
-            switch_count_ = 0;
-        }
     }
 
     // ---------- Callback ----------
@@ -350,7 +343,7 @@ private:
         C->has_latest = true;
 
         // choose which IMU is "active moving" and publish it
-        publishActive();
+        publishActive(dt);
     }
 
     double processAxis(
@@ -430,13 +423,21 @@ private:
     ros::Publisher active_vmag_pub_;
     std_msgs::Float64 active_vmag_msg_;
 
-    ActiveSide active_side_ = ActiveSide::NONE;
+    double v_active_out_ = 0.0;
 
-    double active_stale_sec_   = 0.20;
-    double move_thresh_deg_    = 1.0;
-    double switch_margin_deg_  = 0.5;
-    int    switch_hold_steps_  = 3;
-    int    switch_count_       = 0;
+    // Params (tune in launch)
+    double active_stale_sec_   = 0.20;  // stale cutoff
+    double move_thresh_deg_    = 1.0;   // deltaRPY threshold to consider "moving"
+
+    // Envelope follower
+    double alpha_up_   = 0.7;   // fast rise
+    double alpha_down_ = 0.05;  // slow fall
+
+    // Optional: clamp unrealistic drops per second (extra safety)
+    double max_drop_cms_per_s_ = 200.0; // cm/s per second (set 0 to disable)
+
+    // Mode: 0 = MAX, 1 = deltaRPY-weighted blend
+    int fuse_mode_ = 0;
 };
 
 int main(int argc, char** argv){
