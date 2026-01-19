@@ -55,13 +55,16 @@ constexpr uint16_t CW_SWITCH_ON        = 0x0007;
 constexpr uint16_t CW_ENABLE_OPERATION = 0x000F;
 // ========================================================
 
+constexpr float MAX_VEL = 50.0f; // max velocity
+
+
 namespace kinco {
 
 struct MotorConfig {
   int encoder_res = 65536;
   int max_rpm = 5000;
 
-  double roller_diameter_m = 0.04; // 4 cm roller diameter
+  double roller_diameter_m = 0.042; // 4 cm roller diameter
   double gear_ratio = 10.0;        // motor:roller = 10:1
 
   // Kinco scaling constants (as in your original code)
@@ -234,6 +237,10 @@ private:
 
 class KincoMotor {
 public:
+  // For logging
+  double linearMsToMotorRpm(double roller_v_ms) const { return msToMotorRpm(roller_v_ms); }
+  int32_t motorRpmToDriveUnits(double motor_rpm) const { return rpmToDriveUnits(motor_rpm); }
+
   KincoMotor(CanSocketBus& bus, int node_id, const MotorConfig& cfg)
     : cfg_(cfg), sdo_(bus, node_id)
   {
@@ -403,11 +410,18 @@ int main(int argc, char** argv) {
     ros::Subscriber sub_speed = nh.subscribe<std_msgs::Float64>(
       speed_topic, 50,
       [&](const std_msgs::Float64::ConstPtr& msg){
+        float data = static_cast<float>(msg->data);
+
+        if (!std::isfinite(data)) data = 0.0f;
+        if (data < 0.0f) data = 0.0f;          // optional but recommended
+        if (data > MAX_VEL) data = MAX_VEL;    // your clamp
+
         std::lock_guard<std::mutex> lk(cmd_mtx);
-        latest_v_cms = msg->data; // cm/s
+        latest_v_cms = static_cast<double>(data);
         have_cmd = true;
       }
     );
+
 
     // ----- Command timer -----
     ros::Timer cmd_timer = nh.createTimer(
@@ -425,7 +439,19 @@ int main(int argc, char** argv) {
         v_cms_local = clampNonNegFinite(v_cms_local, max_cmd_cms, enable_max_cmd);
         const double roller_v_ms = v_cms_local * speed_scale;
 
-        for (auto& m : motors) m->setTargetLinearMs(roller_v_ms);
+        for (auto& m : motors) {
+        // compute what will be sent
+        const double motor_rpm = m->linearMsToMotorRpm(roller_v_ms);
+        const int32_t units60FF = m->motorRpmToDriveUnits(motor_rpm);
+
+        ROS_INFO_THROTTLE(0.5,
+          "CAN cmd node=%d: v=%.2f cm/s (%.3f m/s), motor=%.1f rpm, 0x60FF=%d",
+          m->nodeId(), v_cms_local, roller_v_ms, motor_rpm, units60FF
+        );
+
+        m->setTargetLinearMs(roller_v_ms); // this does the SDO write to 0x60FF
+      }
+
       }
     );
 
