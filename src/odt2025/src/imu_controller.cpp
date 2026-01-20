@@ -1,479 +1,603 @@
 // velocity_calculator_dual.cpp
 //
-// Dual-channel IMU velocity estimator + deltaRPY publisher per foot.
-// Publishes:
-//   - /v_mag_left,  /v_mag_right              (std_msgs/Float64)          [cm/s]
-//   - /deltaRPY_left, /deltaRPY_right         (std_msgs/Float64MultiArray) [dR,dP,dY,sumAbs] in deg
-//   - /v_mag_active                           (std_msgs/Float64)          (smoothed "active" velocity)
+// Dual-channel IMU velocity estimator with deltaRPY motion detection.
 //
-// Subscribes (per-channel):
-//   - /imu_data_left, /imu_data_right (std_msgs/Float64MultiArray), expected size==7:
-//       [0]=t_ms, [1]=ax, [2]=ay, [3]=az, [4]=roll_deg, [5]=pitch_deg, [6]=yaw_deg
+// OVERVIEW:
+// - Processes two IMU streams (left/right feet) independently
+// - Estimates velocity using Kalman filtering with ZUPT (Zero velocity UPdaTe)
+// - Detects motion using RPY (Roll/Pitch/Yaw) changes
+// - Fuses both channels into a single "active" velocity output
 //
-// Params:
-//   ~active_stale_sec (double)  default 0.20
-//   ~move_thresh_deg  (double)  default 1.0   (threshold on deltaRPY SUM to consider "moving")
-//   ~alpha_up         (double)  default 0.7
-//   ~alpha_down       (double)  default 0.05
-//   ~max_drop_cms_per_s (double) default 200.0 (0 disables)
-//   ~fuse_mode        (int)     default 0 (0=MAX, 1=deltaRPY-weighted blend)
+// PUBLISHED TOPICS:
+//   /v_mag_left, /v_mag_right          - Per-foot velocity magnitude (cm/s)
+//   /deltaRPY_left, /deltaRPY_right    - Per-foot angular changes [dR, dP, dY, sum] (deg)
+//   /v_mag_active                       - Fused active velocity (cm/s)
 //
-// Per-channel params under ~left/* and ~right/*:
-//   topic (string)           default /imu_data_left|right
-//   out_topic (string)       default /v_mag_left|right
-//   out_topic_RPY (string)   default /deltaRPY_left|right
-//   deadband_x/y/z (double)  defaults 0.15/0.15/0.30
-//   zupt_steps (int)         default 5
-//   Q,R,lpf_alpha,q_v,q_b,r_zupt
-//   dt_min, dt_max
-//   rpy_zupt_thresh_deg
-//
+// SUBSCRIBED TOPICS:
+//   /imu_data_left, /imu_data_right    - IMU data arrays [t_ms, ax, ay, az, roll, pitch, yaw]
+
 #include <ros/ros.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/Float64.h>
-
 #include <boost/bind.hpp>
 #include <cmath>
 #include <string>
 #include <algorithm>
 
-// ----------------- Per-axis state -----------------
+// ============================================================================
+// CONSTANTS & CONFIGURATION
+// ============================================================================
+
+namespace defaults {
+  // Global fusion parameters
+  const double ACTIVE_STALE_SEC = 0.20;      // Max age for "fresh" data
+  const double MOVE_THRESH_DEG = 1.0;        // Angular motion threshold
+  const double ALPHA_UP = 0.7;               // Attack time for velocity rise
+  const double ALPHA_DOWN = 0.05;            // Decay time for velocity fall
+  const double MAX_DROP_CMS_PER_S = 200.0;   // Max velocity decrease rate
+  const int FUSE_MODE = 0;                   // 0=MAX, 1=weighted blend
+  
+  // Per-channel filter parameters
+  const double DEADBAND_X = 0.15;            // Accel deadband (m/s²)
+  const double DEADBAND_Y = 0.15;
+  const double DEADBAND_Z = 0.30;
+  const int ZUPT_STEPS = 5;                  // Stillness confirmation count
+  
+  const double Q = 0.05;                     // Process noise (1D filter)
+  const double R = 0.20;                     // Measurement noise (1D filter)
+  const double LPF_ALPHA = 0.3;              // Low-pass filter coefficient
+  
+  const double Q_V = 0.5;                    // Velocity process noise (2D filter)
+  const double Q_B = 0.01;                   // Bias process noise (2D filter)
+  const double R_ZUPT = 1e-4;                // ZUPT measurement noise
+  
+  const double DT_MIN = 0.001;               // Min valid timestep (s)
+  const double DT_MAX = 0.10;                // Max valid timestep (s)
+  const double RPY_ZUPT_THRESH_DEG = 5.0;    // Angular stillness threshold
+}
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Single-axis Kalman filter state (velocity + bias estimation)
 struct AxisState {
-  double a_hat = 0.0;
-  double P_1d  = 1.0;
-
-  bool   has_light_prev = false;
-  double a_light_prev   = 0.0;
-
-  double v2 = 0.0;
-  double b2 = 0.0;
-
-  double P00 = 1.0, P01 = 0.0, P10 = 0.0, P11 = 1.0;
+  // 1D smoothing filter for acceleration
+  double accel_filtered = 0.0;
+  double accel_variance = 1.0;
+  
+  // Light low-pass filter for integration
+  bool has_prev_accel = false;
+  double prev_accel_lpf = 0.0;
+  
+  // 2D state: velocity and bias
+  double velocity = 0.0;
+  double bias = 0.0;
+  
+  // 2x2 covariance matrix
+  double P00 = 1.0, P01 = 0.0;
+  double P10 = 0.0, P11 = 1.0;
 };
 
-// ----------------- Helpers -----------------
-static inline float wrapDiffDeg(float cur, float prev){
-  float d = cur - prev;
-  while (d >  180.0f) d -= 360.0f;
-  while (d < -180.0f) d += 360.0f;
-  return d;
-}
-
+// Angular change measurement (Roll/Pitch/Yaw)
 struct DeltaRPY {
-  float dR  = 0.f;
-  float dP  = 0.f;
-  float dY  = 0.f;
-  float sum = 0.f;
+  float delta_roll = 0.0f;
+  float delta_pitch = 0.0f;
+  float delta_yaw = 0.0f;
+  float sum_absolute = 0.0f;  // Total angular motion
 };
 
-static inline DeltaRPY calcDeltaRPY(const float cur[3], float prev[3]){
-  DeltaRPY out;
-  out.dR  = wrapDiffDeg(cur[0], prev[0]);
-  out.dP  = wrapDiffDeg(cur[1], prev[1]);
-  out.dY  = wrapDiffDeg(cur[2], prev[2]);
-  out.sum = std::fabs(out.dR) + std::fabs(out.dP) + std::fabs(out.dY);
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 
-  prev[0] = cur[0];
-  prev[1] = cur[1];
-  prev[2] = cur[2];
-  return out;
+// Wrap angle difference to [-180, 180] degrees
+inline float wrapAngleDifference(float current, float previous) {
+  float diff = current - previous;
+  while (diff > 180.0f) diff -= 360.0f;
+  while (diff < -180.0f) diff += 360.0f;
+  return diff;
 }
 
-// ----------------- Node -----------------
-class VelocityCalculatorDual {
+// Calculate change in Roll/Pitch/Yaw and update previous values
+inline DeltaRPY calculateDeltaRPY(const float current[3], float previous[3]) {
+  DeltaRPY result;
+  
+  result.delta_roll = wrapAngleDifference(current[0], previous[0]);
+  result.delta_pitch = wrapAngleDifference(current[1], previous[1]);
+  result.delta_yaw = wrapAngleDifference(current[2], previous[2]);
+  
+  result.sum_absolute = std::fabs(result.delta_roll) + std::fabs(result.delta_pitch) + std::fabs(result.delta_yaw);
+  
+  // Update previous values
+  previous[0] = current[0];
+  previous[1] = current[1];
+  previous[2] = current[2];
+  
+  return result;
+}
+
+// ============================================================================
+// MAIN NODE CLASS
+// ============================================================================
+
+class DualChannelVelocityEstimator {
 public:
-  explicit VelocityCalculatorDual(ros::NodeHandle& pnh) : pnh_(pnh) {
-    ros::NodeHandle lnh(pnh_, "left");
-    ros::NodeHandle rnh(pnh_, "right");
-
-    loadChannelParams(lnh, left_,  "left");
-    loadChannelParams(rnh, right_, "right");
-
-    // Active-selection params (node-level)
-    pnh_.param("active_stale_sec",    active_stale_sec_,    0.20);
-    pnh_.param("move_thresh_deg",     move_thresh_deg_,     1.0);
-    pnh_.param("alpha_up",            alpha_up_,            0.7);
-    pnh_.param("alpha_down",          alpha_down_,          0.05);
-    pnh_.param("max_drop_cms_per_s",  max_drop_cms_per_s_,  200.0);
-    pnh_.param("fuse_mode",           fuse_mode_,           0);
-
-    active_vmag_pub_ = pnh_.advertise<std_msgs::Float64>("/v_mag_active", 10);
-
-    left_.sub = pnh_.subscribe<std_msgs::Float64MultiArray>(
-      left_.topic, 50, boost::bind(&VelocityCalculatorDual::cb, this, _1, &left_)
-    );
-    right_.sub = pnh_.subscribe<std_msgs::Float64MultiArray>(
-      right_.topic, 50, boost::bind(&VelocityCalculatorDual::cb, this, _1, &right_)
-    );
-
-    watchdog_ = pnh_.createTimer(ros::Duration(1.0), &VelocityCalculatorDual::watchdogCb, this);
-
-    ROS_INFO_STREAM("[velocity_calculator_dual] Left  topic: " << left_.topic
-                    << " -> v: " << left_.out_topic_vmag
-                    << " rpy: " << left_.out_topic_rpy);
-    ROS_INFO_STREAM("[velocity_calculator_dual] Right topic: " << right_.topic
-                    << " -> v: " << right_.out_topic_vmag
-                    << " rpy: " << right_.out_topic_rpy);
-    ROS_INFO_STREAM("[velocity_calculator_dual] Active velocity topic: /v_mag_active");
-  }
+  explicit DualChannelVelocityEstimator(ros::NodeHandle& private_nh);
 
 private:
+  // Per-channel configuration and state
   struct Channel {
-    std::string label;
-
-    std::string topic;
-    std::string out_topic_vmag;
-    std::string out_topic_rpy;
-
-    ros::Subscriber sub;
-    ros::Publisher  vmag_pub;
-    ros::Publisher  rpy_pub;
-
-    std_msgs::Float64 vmag_msg;
-    std_msgs::Float64MultiArray rpy_msg;
-
-    ros::Time last_msg_time;
-
-    // Filter params (per channel)
-    double deadband_x = 0.15, deadband_y = 0.15, deadband_z = 0.30;
-    int    zupt_steps = 5;
-
-    double Q = 0.05, R = 0.20;
-    double lpf_alpha = 0.3;
-    double q_v = 0.5;
-    double q_b = 0.01;
-    double r_zupt = 1e-4;
-
-    double dt_min = 0.001;
-    double dt_max = 0.10;
-    double rpy_zupt_thresh_deg = 5.0;
-
+    std::string name;  // "left" or "right"
+    
+    // Topic names
+    std::string input_topic;
+    std::string velocity_topic;
+    std::string delta_rpy_topic;
+    
+    // ROS communication
+    ros::Subscriber subscriber;
+    ros::Publisher velocity_publisher;
+    ros::Publisher delta_rpy_publisher;
+    ros::Time last_message_time;
+    
+    // Filter parameters (tunable per channel)
+    double deadband_x, deadband_y, deadband_z;
+    int zupt_confirmation_steps;
+    double q_1d, r_1d, lpf_alpha;
+    double q_velocity, q_bias, r_zupt;
+    double dt_min, dt_max;
+    double rpy_stillness_threshold_deg;
+    
     // Time tracking
-    bool   have_prev_time = false;
-    double t_prev_ms = 0.0;
-
-    // RPY tracking
-    bool  have_prev_rpy = false;
-    float prev_rpy[3] = {0.f, 0.f, 0.f};
-    int   rpy_still_count = 0;
-
-    // Axis states
-    AxisState x, y, z;
-
-    // Cached outputs (for active selection)
-    bool     has_latest = false;
-    ros::Time latest_stamp;
-    double   vmag = 0.0;       // cm/s
-    double   delta_rpy = 0.0;  // deg-sum (sumAbs)
+    bool has_previous_timestamp = false;
+    double previous_time_ms = 0.0;
+    
+    // RPY motion detection
+    bool has_previous_rpy = false;
+    float previous_rpy[3] = {0.0f, 0.0f, 0.0f};
+    int stillness_counter = 0;
+    
+    // Per-axis filter states
+    AxisState x_axis, y_axis, z_axis;
+    
+    // Latest outputs (for fusion)
+    bool has_valid_output = false;
+    ros::Time output_timestamp;
+    double velocity_magnitude = 0.0;  // cm/s
+    double delta_rpy_sum = 0.0;       // degrees
+    
+    // Message buffers
+    std_msgs::Float64 velocity_msg;
+    std_msgs::Float64MultiArray delta_rpy_msg;
   };
-
-  void loadChannelParams(ros::NodeHandle& nhc, Channel& C, const std::string& label){
-    C.label = label;
-
-    nhc.param<std::string>("topic",        C.topic,         std::string("/imu_data_" + label));
-    nhc.param<std::string>("out_topic",    C.out_topic_vmag,std::string("/v_mag_" + label));
-    nhc.param<std::string>("out_topic_RPY",C.out_topic_rpy, std::string("/deltaRPY_" + label));
-
-    nhc.param("deadband_x", C.deadband_x, 0.15);
-    nhc.param("deadband_y", C.deadband_y, 0.15);
-    nhc.param("deadband_z", C.deadband_z, 0.30);
-    nhc.param("zupt_steps", C.zupt_steps, 5);
-
-    nhc.param("Q", C.Q, 0.05);
-    nhc.param("R", C.R, 0.20);
-    nhc.param("lpf_alpha", C.lpf_alpha, 0.3);
-
-    nhc.param("q_v", C.q_v, 0.5);
-    nhc.param("q_b", C.q_b, 0.01);
-    nhc.param("r_zupt", C.r_zupt, 1e-4);
-
-    nhc.param("dt_min", C.dt_min, 0.001);
-    nhc.param("dt_max", C.dt_max, 0.10);
-
-    nhc.param("rpy_zupt_thresh_deg", C.rpy_zupt_thresh_deg, 5.0);
-
-    C.vmag_pub = pnh_.advertise<std_msgs::Float64>(C.out_topic_vmag, 10);
-    C.rpy_pub  = pnh_.advertise<std_msgs::Float64MultiArray>(C.out_topic_rpy, 10);
-    C.last_msg_time = ros::Time(0);
-  }
-
-  void watchdogCb(const ros::TimerEvent&){
-    warnChannel(left_);
-    warnChannel(right_);
-  }
-
-  void warnChannel(const Channel& C){
-    if (C.last_msg_time.isZero()) {
-      ROS_WARN_THROTTLE(2.0, "[%s] No IMU messages received yet.", C.label.c_str());
-      return;
-    }
-    if ((ros::Time::now() - C.last_msg_time).toSec() > 2.0) {
-      ROS_WARN_THROTTLE(2.0, "[%s] No IMU messages received in >2s.", C.label.c_str());
-    }
-  }
-
-  // ---------- Active selection ----------
-  void publishActive(double dt_fallback){
-    double dt_active = dt_fallback;
-
-    const ros::Time now = ros::Time::now();
-    if (!have_active_time_) {
-      last_active_pub_time_ = now;
-      have_active_time_ = true;
-    } else {
-      dt_active = (now - last_active_pub_time_).toSec();
-      last_active_pub_time_ = now;
-      if (dt_active <= 1e-6) dt_active = dt_fallback;
-    }
-
-    auto isFresh = [&](const Channel& C){
-      if (!C.has_latest) return false;
-      return (now - C.latest_stamp).toSec() <= active_stale_sec_;
-    };
-
-    const bool Lfresh = isFresh(left_);
-    const bool Rfresh = isFresh(right_);
-
-    // If neither fresh: decay toward 0
-    if (!Lfresh && !Rfresh) {
-      const double v_meas = 0.0;
-      const double a = (v_meas > v_active_out_) ? alpha_up_ : alpha_down_;
-      v_active_out_ += a * (v_meas - v_active_out_);
-      active_vmag_msg_.data = v_active_out_;
-      active_vmag_pub_.publish(active_vmag_msg_);
-      return;
-    }
-
-    const double vL = Lfresh ? left_.vmag  : 0.0;
-    const double vR = Rfresh ? right_.vmag : 0.0;
-
-    const double dL = Lfresh ? left_.delta_rpy  : 0.0;
-    const double dR = Rfresh ? right_.delta_rpy : 0.0;
-
-    const bool Lmoving = (dL >= move_thresh_deg_);
-    const bool Rmoving = (dR >= move_thresh_deg_);
-
-    double v_meas = 0.0;
-
-    if (Lmoving || Rmoving) {
-      if (fuse_mode_ == 0) {
-        v_meas = std::max(vL, vR);
-      } else {
-        const double wL_raw = std::max(0.0, dL - move_thresh_deg_);
-        const double wR_raw = std::max(0.0, dR - move_thresh_deg_);
-        const double sum = wL_raw + wR_raw + 1e-9;
-        const double wL = wL_raw / sum;
-        v_meas = wL * vL + (1.0 - wL) * vR;
-      }
-    } else {
-      v_meas = 0.0;
-    }
-
-    // Envelope follower
-    const double a = (v_meas > v_active_out_) ? alpha_up_ : alpha_down_;
-    double v_next = v_active_out_ + a * (v_meas - v_active_out_);
-
-    // Optional: clamp maximum drop rate
-    if (max_drop_cms_per_s_ > 0.0 && dt_active > 1e-6) {
-      const double max_drop = max_drop_cms_per_s_ * dt_active;
-      if (v_next < v_active_out_ - max_drop) v_next = v_active_out_ - max_drop;
-    }
-
-    v_active_out_ = v_next;
-    active_vmag_msg_.data = v_active_out_;
-    active_vmag_pub_.publish(active_vmag_msg_);
-  }
-
-  // ---------- Filter axis ----------
-  void processAxis(
-    AxisState& S,
-    double a_in,
-    double deadband,
-    double F00, double F01, double F10, double F11,
-    double dt,
-    bool still_global,
-    const Channel& C
-  ){
-    // deadband on measurement
-    double z = a_in;
-    if (std::abs(z) < deadband) z = 0.0;
-
-    // 1D KF on accel (optional smoothing)
-    S.P_1d += C.Q;
-    const double K = S.P_1d / (S.P_1d + C.R);
-    S.a_hat += K * (z - S.a_hat);
-    S.P_1d  *= (1.0 - K);
-
-    // light LPF accel (used for integration)
-    double a_light = a_in;
-    if (!S.has_light_prev) {
-      S.has_light_prev = true;
-    } else {
-      a_light = C.lpf_alpha * S.a_light_prev + (1.0 - C.lpf_alpha) * a_in;
-    }
-    S.a_light_prev = a_light;
-
-    const double u = a_light;
-
-    // integrate with bias estimate
-    S.v2 += (u - S.b2) * dt;
-
-    // 2-state covariance predict
-    const double A00 = F00 * S.P00 + F01 * S.P10;
-    const double A01 = F00 * S.P01 + F01 * S.P11;
-    const double A10 = F10 * S.P00 + F11 * S.P10;
-    const double A11 = F10 * S.P01 + F11 * S.P11;
-
-    const double P00p = A00 * F00 + A01 * F01 + C.q_v * dt * dt;
-    const double P01p = A00 * F10 + A01 * F11;
-    const double P10p = A10 * F00 + A11 * F01;
-    const double P11p = A10 * F10 + A11 * F11 + C.q_b * dt;
-
-    S.P00 = P00p; S.P01 = P01p; S.P10 = P10p; S.P11 = P11p;
-
-    // ZUPT update when still
-    if (still_global) {
-      const double innov = -S.v2;
-      const double Szz   = S.P00 + C.r_zupt;
-
-      const double K0 = S.P00 / Szz;
-      const double K1 = S.P10 / Szz;
-
-      S.v2 += K0 * innov;
-      S.b2 += K1 * innov;
-
-      const double P00_old = S.P00;
-      const double P01_old = S.P01;
-      const double P10_old = S.P10;
-      const double P11_old = S.P11;
-
-      S.P00 = (1.0 - K0) * P00_old;
-      S.P01 = (1.0 - K0) * P01_old;
-      S.P10 = P10_old - K1 * P00_old;
-      S.P11 = P11_old - K1 * P01_old;
-    }
-  }
-
-  // ---------- Callback ----------
-  void cb(const std_msgs::Float64MultiArray::ConstPtr& msg, Channel* C){
-    C->last_msg_time = ros::Time::now();
-
-    const auto& arr = msg->data;
-    if (arr.size() != 7) {
-      ROS_WARN_THROTTLE(1.0, "[%s] expected size==7, got %zu", C->label.c_str(), arr.size());
-      return;
-    }
-
-    const double t_ms = arr[0];
-    const double ax   = arr[1];
-    const double ay   = arr[2];
-    const double az   = arr[3];
-
-    const float current_angle[3] = {
-      static_cast<float>(arr[4]),
-      static_cast<float>(arr[5]),
-      static_cast<float>(arr[6])
-    };
-
-    // init on first message
-    if (!C->have_prev_time) {
-      C->t_prev_ms = t_ms;
-      C->have_prev_time = true;
-
-      C->prev_rpy[0] = current_angle[0];
-      C->prev_rpy[1] = current_angle[1];
-      C->prev_rpy[2] = current_angle[2];
-      C->have_prev_rpy = true;
-      return;
-    }
-
-    const double dt = (t_ms - C->t_prev_ms) * 1e-3;
-    if (!(dt > 0.0)) {
-      ROS_WARN_THROTTLE(1.0, "[%s] Non-positive dt. Resyncing.", C->label.c_str());
-      C->t_prev_ms = t_ms;
-      return;
-    }
-    C->t_prev_ms = t_ms;
-
-    if (dt < C->dt_min || dt > C->dt_max) {
-      ROS_WARN_THROTTLE(1.0, "[%s] dt=%.6f rejected (min=%.6f max=%.6f).",
-                        C->label.c_str(), dt, C->dt_min, C->dt_max);
-      return;
-    }
-
-    const double F00 = 1.0, F01 = -dt;
-    const double F10 = 0.0, F11 =  1.0;
-
-    // deltaRPY (deg)
-    DeltaRPY drpy = calcDeltaRPY(current_angle, C->prev_rpy);
-
-    if (drpy.sum <= static_cast<float>(C->rpy_zupt_thresh_deg)) C->rpy_still_count++;
-    else C->rpy_still_count = 0;
-
-    const bool still_global = (C->rpy_still_count >= C->zupt_steps);
-
-    // Filter/integrate each axis
-    processAxis(C->x, ax, C->deadband_x, F00, F01, F10, F11, dt, still_global, *C);
-    processAxis(C->y, ay, C->deadband_y, F00, F01, F10, F11, dt, still_global, *C);
-    processAxis(C->z, az, C->deadband_z, F00, F01, F10, F11, dt, still_global, *C);
-
-    const double vx = C->x.v2;
-    const double vy = C->y.v2;
-    const double vz = C->z.v2;
-
-    const double v_mag = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0; // cm/s
-
-    // publish vmag
-    C->vmag_msg.data = v_mag;
-    C->vmag_pub.publish(C->vmag_msg);
-
-    // publish deltaRPY as MultiArray: [dR,dP,dY,sum]
-    C->rpy_msg.data.resize(4);
-    C->rpy_msg.data[0] = drpy.dR;
-    C->rpy_msg.data[1] = drpy.dP;
-    C->rpy_msg.data[2] = drpy.dY;
-    C->rpy_msg.data[3] = drpy.sum;
-    C->rpy_pub.publish(C->rpy_msg);
-
-    // cache latest for active selection
-    C->vmag        = v_mag;
-    C->delta_rpy   = drpy.sum;
-    C->latest_stamp= ros::Time::now();
-    C->has_latest  = true;
-
-    publishActive(dt);
-  }
-
-private:
-  ros::NodeHandle pnh_;
-  ros::Timer watchdog_;
-
-  Channel left_;
-  Channel right_;
-
-  // Active-selection state (node-level)
-  ros::Publisher active_vmag_pub_;
-  std_msgs::Float64 active_vmag_msg_;
-
-  double v_active_out_ = 0.0;
-
-  // Params (tune in launch)
-  double active_stale_sec_    = 0.20;
-  double move_thresh_deg_     = 1.0;
-  double alpha_up_            = 0.7;
-  double alpha_down_          = 0.05;
-  double max_drop_cms_per_s_  = 200.0;
-  int    fuse_mode_           = 0;
-
-  ros::Time last_active_pub_time_;
-  bool have_active_time_ = false;
+  
+  // Initialize channel parameters from ROS parameter server
+  void loadChannelParameters(ros::NodeHandle& channel_nh, Channel& channel, 
+                            const std::string& name);
+  
+  // Process incoming IMU data for a channel
+  void imuCallback(const std_msgs::Float64MultiArray::ConstPtr& msg, Channel* channel);
+  
+  // Apply Kalman filter to single axis
+  void filterAxis(AxisState& state, double accel_measured, double deadband,
+                 double state_transition_00, double state_transition_01,
+                 double state_transition_10, double state_transition_11,
+                 double dt, bool apply_zupt, const Channel& channel);
+  
+  // Fuse left/right channels into active velocity
+  void publishActiveVelocity(double fallback_dt);
+  
+  // Check for stale data and warn
+  void watchdogCallback(const ros::TimerEvent& event);
+  void checkChannelHealth(const Channel& channel);
+  
+  // Member variables
+  ros::NodeHandle node_handle_;
+  ros::Timer watchdog_timer_;
+  
+  Channel left_channel_;
+  Channel right_channel_;
+  
+  // Active velocity fusion
+  ros::Publisher active_velocity_publisher_;
+  std_msgs::Float64 active_velocity_msg_;
+  double active_velocity_output_ = 0.0;
+  
+  // Fusion parameters
+  double data_freshness_threshold_sec_;
+  double motion_threshold_deg_;
+  double alpha_rising_;
+  double alpha_falling_;
+  double max_velocity_drop_rate_;
+  int fusion_mode_;
+  
+  // Timing for active velocity updates
+  ros::Time last_active_publish_time_;
+  bool has_active_publish_time_ = false;
 };
 
-int main(int argc, char** argv){
-  ros::init(argc, argv, "velocity_calculator_dual");
-  ros::NodeHandle pnh("~");
+// ============================================================================
+// IMPLEMENTATION
+// ============================================================================
 
-  VelocityCalculatorDual node(pnh);
+DualChannelVelocityEstimator::DualChannelVelocityEstimator(ros::NodeHandle& private_nh)
+    : node_handle_(private_nh) {
+  
+  // Create namespaced node handles for each channel
+  ros::NodeHandle left_nh(private_nh, "left");
+  ros::NodeHandle right_nh(private_nh, "right");
+  
+  loadChannelParameters(left_nh, left_channel_, "left");
+  loadChannelParameters(right_nh, right_channel_, "right");
+  
+  // Load global fusion parameters
+  private_nh.param("active_stale_sec", data_freshness_threshold_sec_, 
+                   defaults::ACTIVE_STALE_SEC);
+  private_nh.param("move_thresh_deg", motion_threshold_deg_, 
+                   defaults::MOVE_THRESH_DEG);
+  private_nh.param("alpha_up", alpha_rising_, defaults::ALPHA_UP);
+  private_nh.param("alpha_down", alpha_falling_, defaults::ALPHA_DOWN);
+  private_nh.param("max_drop_cms_per_s", max_velocity_drop_rate_, 
+                   defaults::MAX_DROP_CMS_PER_S);
+  private_nh.param("fuse_mode", fusion_mode_, defaults::FUSE_MODE);
+  
+  // Set up publishers and subscribers
+  active_velocity_publisher_ = private_nh.advertise<std_msgs::Float64>(
+      "/v_mag_active", 10);
+  
+  left_channel_.subscriber = private_nh.subscribe<std_msgs::Float64MultiArray>(
+      left_channel_.input_topic, 50,
+      boost::bind(&DualChannelVelocityEstimator::imuCallback, this, _1, &left_channel_));
+  
+  right_channel_.subscriber = private_nh.subscribe<std_msgs::Float64MultiArray>(
+      right_channel_.input_topic, 50,
+      boost::bind(&DualChannelVelocityEstimator::imuCallback, this, _1, &right_channel_));
+  
+  watchdog_timer_ = private_nh.createTimer(
+      ros::Duration(1.0), &DualChannelVelocityEstimator::watchdogCallback, this);
+  
+  // Log configuration
+  ROS_INFO_STREAM("[DualVelocityEstimator] Left channel: " 
+                  << left_channel_.input_topic << " -> velocity: " 
+                  << left_channel_.velocity_topic << ", rpy: " 
+                  << left_channel_.delta_rpy_topic);
+  ROS_INFO_STREAM("[DualVelocityEstimator] Right channel: " 
+                  << right_channel_.input_topic << " -> velocity: " 
+                  << right_channel_.velocity_topic << ", rpy: " 
+                  << right_channel_.delta_rpy_topic);
+  ROS_INFO_STREAM("[DualVelocityEstimator] Active velocity: /v_mag_active");
+}
+
+void DualChannelVelocityEstimator::loadChannelParameters(
+    ros::NodeHandle& channel_nh, Channel& channel, const std::string& name) {
+  
+  channel.name = name;
+  
+  // Topic names
+  channel_nh.param<std::string>("topic", channel.input_topic, 
+                                "/imu_data_" + name);
+  channel_nh.param<std::string>("out_topic", channel.velocity_topic, 
+                                "/v_mag_" + name);
+  channel_nh.param<std::string>("out_topic_RPY", channel.delta_rpy_topic, 
+                                "/deltaRPY_" + name);
+  
+  // Deadbands
+  channel_nh.param("deadband_x", channel.deadband_x, defaults::DEADBAND_X);
+  channel_nh.param("deadband_y", channel.deadband_y, defaults::DEADBAND_Y);
+  channel_nh.param("deadband_z", channel.deadband_z, defaults::DEADBAND_Z);
+  
+  // ZUPT parameters
+  channel_nh.param("zupt_steps", channel.zupt_confirmation_steps, defaults::ZUPT_STEPS);
+  channel_nh.param("rpy_zupt_thresh_deg", channel.rpy_stillness_threshold_deg, 
+                   defaults::RPY_ZUPT_THRESH_DEG);
+  
+  // 1D filter parameters
+  channel_nh.param("Q", channel.q_1d, defaults::Q);
+  channel_nh.param("R", channel.r_1d, defaults::R);
+  channel_nh.param("lpf_alpha", channel.lpf_alpha, defaults::LPF_ALPHA);
+  
+  // 2D filter parameters
+  channel_nh.param("q_v", channel.q_velocity, defaults::Q_V);
+  channel_nh.param("q_b", channel.q_bias, defaults::Q_B);
+  channel_nh.param("r_zupt", channel.r_zupt, defaults::R_ZUPT);
+  
+  // Time constraints
+  channel_nh.param("dt_min", channel.dt_min, defaults::DT_MIN);
+  channel_nh.param("dt_max", channel.dt_max, defaults::DT_MAX);
+  
+  // Create publishers
+  channel.velocity_publisher = node_handle_.advertise<std_msgs::Float64>(
+      channel.velocity_topic, 10);
+  channel.delta_rpy_publisher = node_handle_.advertise<std_msgs::Float64MultiArray>(
+      channel.delta_rpy_topic, 10);
+  
+  channel.last_message_time = ros::Time(0);
+}
+
+void DualChannelVelocityEstimator::imuCallback(
+    const std_msgs::Float64MultiArray::ConstPtr& msg, Channel* channel) {
+  
+  channel->last_message_time = ros::Time::now();
+  
+  // Validate message format
+  const auto& data = msg->data;
+  if (data.size() != 7) {
+    ROS_WARN_THROTTLE(1.0, "[%s] Expected 7 values, got %zu", 
+                      channel->name.c_str(), data.size());
+    return;
+  }
+  
+  // Parse IMU data: [timestamp_ms, ax, ay, az, roll_deg, pitch_deg, yaw_deg]
+  const double timestamp_ms = data[0];
+  const double accel_x = data[1];
+  const double accel_y = data[2];
+  const double accel_z = data[3];
+  const float current_rpy[3] = {
+      static_cast<float>(data[4]),
+      static_cast<float>(data[5]),
+      static_cast<float>(data[6])
+  };
+  
+  // Initialize on first message
+  if (!channel->has_previous_timestamp) {
+    channel->previous_time_ms = timestamp_ms;
+    channel->has_previous_timestamp = true;
+    
+    channel->previous_rpy[0] = current_rpy[0];
+    channel->previous_rpy[1] = current_rpy[1];
+    channel->previous_rpy[2] = current_rpy[2];
+    channel->has_previous_rpy = true;
+    return;
+  }
+  
+  // Calculate time step
+  const double dt = (timestamp_ms - channel->previous_time_ms) * 1e-3;
+  
+  if (dt <= 0.0) {
+    ROS_WARN_THROTTLE(1.0, "[%s] Non-positive timestep, resyncing", 
+                      channel->name.c_str());
+    channel->previous_time_ms = timestamp_ms;
+    return;
+  }
+  
+  channel->previous_time_ms = timestamp_ms;
+  
+  // Validate timestep
+  if (dt < channel->dt_min || dt > channel->dt_max) {
+    ROS_WARN_THROTTLE(1.0, "[%s] dt=%.6f outside valid range [%.6f, %.6f]",
+                      channel->name.c_str(), dt, channel->dt_min, channel->dt_max);
+    return;
+  }
+  
+  // State transition matrix for velocity-bias model
+  const double F00 = 1.0, F01 = -dt;
+  const double F10 = 0.0, F11 = 1.0;
+  
+  // Calculate angular motion
+  DeltaRPY angular_change = calculateDeltaRPY(current_rpy, channel->previous_rpy);
+  
+  // Update stillness counter
+  if (angular_change.sum_absolute <= static_cast<float>(channel->rpy_stillness_threshold_deg)) {
+    channel->stillness_counter++;
+  } else {
+    channel->stillness_counter = 0;
+  }
+  
+  const bool is_stationary = (channel->stillness_counter >= channel->zupt_confirmation_steps);
+  
+  // Filter each axis independently
+  filterAxis(channel->x_axis, accel_x, channel->deadband_x, 
+             F00, F01, F10, F11, dt, is_stationary, *channel);
+  filterAxis(channel->y_axis, accel_y, channel->deadband_y, 
+             F00, F01, F10, F11, dt, is_stationary, *channel);
+  filterAxis(channel->z_axis, accel_z, channel->deadband_z, 
+             F00, F01, F10, F11, dt, is_stationary, *channel);
+  
+  // Calculate 3D velocity magnitude
+  const double vx = channel->x_axis.velocity;
+  const double vy = channel->y_axis.velocity;
+  const double vz = channel->z_axis.velocity;
+  const double velocity_magnitude = std::sqrt(vx*vx + vy*vy + vz*vz) * 100.0;  // m/s to cm/s
+  
+  // Publish velocity magnitude
+  channel->velocity_msg.data = velocity_magnitude;
+  channel->velocity_publisher.publish(channel->velocity_msg);
+  
+  // Publish deltaRPY as [dRoll, dPitch, dYaw, sumAbsolute]
+  channel->delta_rpy_msg.data.resize(4);
+  channel->delta_rpy_msg.data[0] = angular_change.delta_roll;
+  channel->delta_rpy_msg.data[1] = angular_change.delta_pitch;
+  channel->delta_rpy_msg.data[2] = angular_change.delta_yaw;
+  channel->delta_rpy_msg.data[3] = angular_change.sum_absolute;
+  channel->delta_rpy_publisher.publish(channel->delta_rpy_msg);
+  
+  // Cache results for fusion
+  channel->velocity_magnitude = velocity_magnitude;
+  channel->delta_rpy_sum = angular_change.sum_absolute;
+  channel->output_timestamp = ros::Time::now();
+  channel->has_valid_output = true;
+  
+  // Update fused active velocity
+  publishActiveVelocity(dt);
+}
+
+void DualChannelVelocityEstimator::filterAxis(
+    AxisState& state, double accel_measured, double deadband,
+    double F00, double F01, double F10, double F11,
+    double dt, bool apply_zupt, const Channel& channel) {
+  
+  // Apply deadband to measurement
+  double accel_deadbanded = accel_measured;
+  if (std::abs(accel_deadbanded) < deadband) {
+    accel_deadbanded = 0.0;
+  }
+  
+  // 1D Kalman filter for acceleration smoothing
+  state.accel_variance += channel.q_1d;
+  const double kalman_gain = state.accel_variance / (state.accel_variance + channel.r_1d);
+  state.accel_filtered += kalman_gain * (accel_deadbanded - state.accel_filtered);
+  state.accel_variance *= (1.0 - kalman_gain);
+  
+  // Light low-pass filter for integration
+  double accel_for_integration = accel_measured;
+  if (state.has_prev_accel) {
+    accel_for_integration = channel.lpf_alpha * state.prev_accel_lpf + 
+                           (1.0 - channel.lpf_alpha) * accel_measured;
+  }
+  state.prev_accel_lpf = accel_for_integration;
+  state.has_prev_accel = true;
+  
+  // Integrate velocity (with bias compensation)
+  state.velocity += (accel_for_integration - state.bias) * dt;
+  
+  // Predict covariance (2x2 matrix)
+  const double temp00 = F00 * state.P00 + F01 * state.P10;
+  const double temp01 = F00 * state.P01 + F01 * state.P11;
+  const double temp10 = F10 * state.P00 + F11 * state.P10;
+  const double temp11 = F10 * state.P01 + F11 * state.P11;
+  
+  state.P00 = temp00 * F00 + temp01 * F01 + channel.q_velocity * dt * dt;
+  state.P01 = temp00 * F10 + temp01 * F11;
+  state.P10 = temp10 * F00 + temp11 * F01;
+  state.P11 = temp10 * F10 + temp11 * F11 + channel.q_bias * dt;
+  
+  // Apply ZUPT (Zero velocity UPdaTe) when stationary
+  if (apply_zupt) {
+    const double innovation = -state.velocity;  // Expected velocity is zero
+    const double innovation_variance = state.P00 + channel.r_zupt;
+    
+    const double gain_velocity = state.P00 / innovation_variance;
+    const double gain_bias = state.P10 / innovation_variance;
+    
+    state.velocity += gain_velocity * innovation;
+    state.bias += gain_bias * innovation;
+    
+    // Update covariance
+    const double P00_old = state.P00;
+    const double P01_old = state.P01;
+    const double P10_old = state.P10;
+    const double P11_old = state.P11;
+    
+    state.P00 = (1.0 - gain_velocity) * P00_old;
+    state.P01 = (1.0 - gain_velocity) * P01_old;
+    state.P10 = P10_old - gain_bias * P00_old;
+    state.P11 = P11_old - gain_bias * P01_old;
+  }
+}
+
+void DualChannelVelocityEstimator::publishActiveVelocity(double fallback_dt) {
+  double dt = fallback_dt;
+  
+  // Calculate time since last active velocity publish
+  const ros::Time now = ros::Time::now();
+  if (!has_active_publish_time_) {
+    last_active_publish_time_ = now;
+    has_active_publish_time_ = true;
+  } else {
+    dt = (now - last_active_publish_time_).toSec();
+    last_active_publish_time_ = now;
+    if (dt <= 1e-6) dt = fallback_dt;
+  }
+  
+  // Check data freshness
+  auto isDataFresh = [&](const Channel& ch) {
+    if (!ch.has_valid_output) return false;
+    return (now - ch.output_timestamp).toSec() <= data_freshness_threshold_sec_;
+  };
+  
+  const bool left_fresh = isDataFresh(left_channel_);
+  const bool right_fresh = isDataFresh(right_channel_);
+  
+  // If neither channel has fresh data, decay to zero
+  if (!left_fresh && !right_fresh) {
+    const double target = 0.0;
+    const double alpha = (target > active_velocity_output_) ? alpha_rising_ : alpha_falling_;
+    active_velocity_output_ += alpha * (target - active_velocity_output_);
+    
+    active_velocity_msg_.data = active_velocity_output_;
+    active_velocity_publisher_.publish(active_velocity_msg_);
+    return;
+  }
+  
+  // Get velocities and motion indicators
+  const double vel_left = left_fresh ? left_channel_.velocity_magnitude : 0.0;
+  const double vel_right = right_fresh ? right_channel_.velocity_magnitude : 0.0;
+  
+  const double motion_left = left_fresh ? left_channel_.delta_rpy_sum : 0.0;
+  const double motion_right = right_fresh ? right_channel_.delta_rpy_sum : 0.0;
+  
+  const bool left_moving = (motion_left >= motion_threshold_deg_);
+  const bool right_moving = (motion_right >= motion_threshold_deg_);
+  
+  // Fuse velocities based on motion detection
+  double target_velocity = 0.0;
+  
+  if (left_moving || right_moving) {
+    if (fusion_mode_ == 0) {
+      // MAX fusion: use whichever foot is moving faster
+      target_velocity = std::max(vel_left, vel_right);
+    } else {
+      // Weighted blend based on amount of angular motion
+      const double weight_left_raw = std::max(0.0, motion_left - motion_threshold_deg_);
+      const double weight_right_raw = std::max(0.0, motion_right - motion_threshold_deg_);
+      const double total_weight = weight_left_raw + weight_right_raw + 1e-9;
+      const double weight_left = weight_left_raw / total_weight;
+      
+      target_velocity = weight_left * vel_left + (1.0 - weight_left) * vel_right;
+    }
+  } else {
+    target_velocity = 0.0;
+  }
+  
+  // Envelope follower: asymmetric rise/fall rates
+  const double alpha = (target_velocity > active_velocity_output_) ? alpha_rising_ : alpha_falling_;
+  double next_velocity = active_velocity_output_ + alpha * (target_velocity - active_velocity_output_);
+  
+  // Limit maximum velocity drop rate (prevents unrealistic jumps)
+  if (max_velocity_drop_rate_ > 0.0 && dt > 1e-6) {
+    const double max_drop = max_velocity_drop_rate_ * dt;
+    if (next_velocity < active_velocity_output_ - max_drop) {
+      next_velocity = active_velocity_output_ - max_drop;
+    }
+  }
+  
+  active_velocity_output_ = next_velocity;
+  active_velocity_msg_.data = active_velocity_output_;
+  active_velocity_publisher_.publish(active_velocity_msg_);
+}
+
+void DualChannelVelocityEstimator::watchdogCallback(const ros::TimerEvent&) {
+  checkChannelHealth(left_channel_);
+  checkChannelHealth(right_channel_);
+}
+
+void DualChannelVelocityEstimator::checkChannelHealth(const Channel& channel) {
+  if (channel.last_message_time.isZero()) {
+    ROS_WARN_THROTTLE(2.0, "[%s] No IMU messages received yet", 
+                      channel.name.c_str());
+    return;
+  }
+  
+  const double age = (ros::Time::now() - channel.last_message_time).toSec();
+  if (age > 2.0) {
+    ROS_WARN_THROTTLE(2.0, "[%s] No IMU messages for %.1f seconds", 
+                      channel.name.c_str(), age);
+  }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+int main(int argc, char** argv) {
+  ros::init(argc, argv, "velocity_calculator_dual");
+  ros::NodeHandle private_nh("~");
+  
+  DualChannelVelocityEstimator node(private_nh);
+  
+  ROS_INFO("[DualVelocityEstimator] Node started, spinning...");
   ros::spin();
+  
   return 0;
 }
