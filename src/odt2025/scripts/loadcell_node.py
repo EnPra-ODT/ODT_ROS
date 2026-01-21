@@ -42,7 +42,7 @@ def main():
         
     port = rospy.get_param('~port', '/dev/ttyACM0')
     baud = rospy.get_param('~baud', 115200)
-    threshold = rospy.get_param('~threshold', 10.0)
+    threshold = rospy.get_param('~threshold', 15.0)
 
     ser = serial.Serial(port, baud, timeout=1)
     rospy.sleep(2.0)
@@ -147,14 +147,14 @@ def main():
                 raw_ch7 -= offset_ch7
                 raw_ch8 -= offset_ch8
 
-            ch1_N = raw_ch1 * 0.00981
-            ch2_N = raw_ch2 * 0.00981
-            ch3_N = raw_ch3 * 0.00981
-            ch4_N = raw_ch4 * 0.00981
-            ch5_N = raw_ch5 * 0.00981
-            ch6_N = raw_ch6 * 0.00981
-            ch7_N = raw_ch7 * 0.00981
-            ch8_N = raw_ch8 * 0.00981
+            ch1_N = abs(raw_ch1 * 0.00981)
+            ch2_N = abs(raw_ch2 * 0.00981)
+            ch3_N = abs(raw_ch3 * 0.00981)
+            ch4_N = abs(raw_ch4 * 0.00981)
+            ch5_N = abs(raw_ch5 * 0.00981)
+            ch6_N = abs(raw_ch6 * 0.00981)
+            ch7_N = abs(raw_ch7 * 0.00981)
+            ch8_N = abs(raw_ch8 * 0.00981)
 
             pub_ch1.publish(ch1_N)
             pub_ch2.publish(ch2_N)

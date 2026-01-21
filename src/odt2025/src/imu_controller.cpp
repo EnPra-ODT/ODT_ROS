@@ -1,22 +1,25 @@
-// velocity_calculator_dual.cpp
+// imu_controller.cpp
 //
-// Dual-channel IMU velocity estimator + deltaRPY publisher per foot.
-// Publishes:
-//   - /v_mag_left,  /v_mag_right              (std_msgs/Float64)          [cm/s]
-//   - /deltaRPY_left, /deltaRPY_right         (std_msgs/Float64MultiArray) [dR,dP,dY,sumAbs] in deg
-//   - /v_mag_active                           (std_msgs/Float64)          (smoothed "active" velocity)
+// Dual-channel IMU velocity estimator + deltaRPY publisher per foot, plus an "active" fused velocity.
 //
 // Subscribes (per-channel):
-//   - /imu_data_left, /imu_data_right (std_msgs/Float64MultiArray), expected size==7:
+//   - /imu_data_left, /imu_data_right   (std_msgs/Float64MultiArray), expected size==7
+//     Layout expected:
 //       [0]=t_ms, [1]=ax, [2]=ay, [3]=az, [4]=roll_deg, [5]=pitch_deg, [6]=yaw_deg
 //
-// Params:
-//   ~active_stale_sec (double)  default 0.20
-//   ~move_thresh_deg  (double)  default 1.0   (threshold on deltaRPY SUM to consider "moving")
-//   ~alpha_up         (double)  default 0.7
-//   ~alpha_down       (double)  default 0.05
-//   ~max_drop_cms_per_s (double) default 200.0 (0 disables)
-//   ~fuse_mode        (int)     default 0 (0=MAX, 1=deltaRPY-weighted blend)
+// Publishes:
+//   - /v_mag_left,  /v_mag_right        (std_msgs/Float64)           [cm/s]
+//   - /deltaRPY_left, /deltaRPY_right   (std_msgs/Float64MultiArray) [dR,dP,dY,sumAbs] in deg
+//   - /v_mag_active                     (std_msgs/Float64)           (smoothed "active" velocity)
+//
+// Params (~):
+//   active_out_topic      (string)  default "/v_mag_active"   <-- IMPORTANT (no joystick needed)
+//   active_stale_sec      (double)  default 0.20
+//   move_thresh_deg       (double)  default 1.0
+//   alpha_up              (double)  default 0.7
+//   alpha_down            (double)  default 0.05
+//   max_drop_cms_per_s    (double)  default 200.0   (0 disables)
+//   fuse_mode             (int)     default 0       (0=MAX(vL,vR), 1=deltaRPY-weighted blend)
 //
 // Per-channel params under ~left/* and ~right/*:
 //   topic (string)           default /imu_data_left|right
@@ -28,6 +31,10 @@
 //   dt_min, dt_max
 //   rpy_zupt_thresh_deg
 //
+// Notes:
+// - This node requires t_ms to increase (data[0]). If it stays constant, dt<=0 and no output.
+// - If your IMU layout differs (e.g., yaw at data[4]), update the indices accordingly.
+
 #include <ros/ros.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/Float64.h>
@@ -79,10 +86,15 @@ static inline DeltaRPY calcDeltaRPY(const float cur[3], float prev[3]){
   return out;
 }
 
+static inline bool finiteOrZero(double &x){
+  if (!std::isfinite(x)) { x = 0.0; return false; }
+  return true;
+}
+
 // ----------------- Node -----------------
-class VelocityCalculatorDual {
+class ImuController {
 public:
-  explicit VelocityCalculatorDual(ros::NodeHandle& pnh) : pnh_(pnh) {
+  explicit ImuController(ros::NodeHandle& pnh) : pnh_(pnh) {
     ros::NodeHandle lnh(pnh_, "left");
     ros::NodeHandle rnh(pnh_, "right");
 
@@ -90,31 +102,33 @@ public:
     loadChannelParams(rnh, right_, "right");
 
     // Active-selection params (node-level)
-    pnh_.param("active_stale_sec",    active_stale_sec_,    0.20);
-    pnh_.param("move_thresh_deg",     move_thresh_deg_,     1.0);
-    pnh_.param("alpha_up",            alpha_up_,            0.7);
-    pnh_.param("alpha_down",          alpha_down_,          0.05);
-    pnh_.param("max_drop_cms_per_s",  max_drop_cms_per_s_,  200.0);
-    pnh_.param("fuse_mode",           fuse_mode_,           0);
+    pnh_.param("active_stale_sec",   active_stale_sec_,   0.20);
+    pnh_.param("move_thresh_deg",    move_thresh_deg_,    1.0);
+    pnh_.param("alpha_up",           alpha_up_,           0.7);
+    pnh_.param("alpha_down",         alpha_down_,         0.05);
+    pnh_.param("max_drop_cms_per_s", max_drop_cms_per_s_, 200.0);
+    pnh_.param("fuse_mode",          fuse_mode_,          0);
 
-    active_vmag_pub_ = pnh_.advertise<std_msgs::Float64>("/v_mag_active", 10);
+    std::string active_out_topic;
+    pnh_.param<std::string>("active_out_topic", active_out_topic, std::string("/v_mag_active"));
+    active_vmag_pub_ = pnh_.advertise<std_msgs::Float64>(active_out_topic, 10);
 
     left_.sub = pnh_.subscribe<std_msgs::Float64MultiArray>(
-      left_.topic, 50, boost::bind(&VelocityCalculatorDual::cb, this, _1, &left_)
+      left_.topic, 50, boost::bind(&ImuController::cb, this, _1, &left_)
     );
     right_.sub = pnh_.subscribe<std_msgs::Float64MultiArray>(
-      right_.topic, 50, boost::bind(&VelocityCalculatorDual::cb, this, _1, &right_)
+      right_.topic, 50, boost::bind(&ImuController::cb, this, _1, &right_)
     );
 
-    watchdog_ = pnh_.createTimer(ros::Duration(1.0), &VelocityCalculatorDual::watchdogCb, this);
+    watchdog_ = pnh_.createTimer(ros::Duration(1.0), &ImuController::watchdogCb, this);
 
-    ROS_INFO_STREAM("[velocity_calculator_dual] Left  topic: " << left_.topic
+    ROS_INFO_STREAM("[imu_controller] Left  topic: " << left_.topic
                     << " -> v: " << left_.out_topic_vmag
                     << " rpy: " << left_.out_topic_rpy);
-    ROS_INFO_STREAM("[velocity_calculator_dual] Right topic: " << right_.topic
+    ROS_INFO_STREAM("[imu_controller] Right topic: " << right_.topic
                     << " -> v: " << right_.out_topic_vmag
                     << " rpy: " << right_.out_topic_rpy);
-    ROS_INFO_STREAM("[velocity_calculator_dual] Active velocity topic: /v_mag_active");
+    ROS_INFO_STREAM("[imu_controller] Active velocity topic: " << active_out_topic);
   }
 
 private:
@@ -161,18 +175,18 @@ private:
     AxisState x, y, z;
 
     // Cached outputs (for active selection)
-    bool     has_latest = false;
+    bool      has_latest   = false;
     ros::Time latest_stamp;
-    double   vmag = 0.0;       // cm/s
-    double   delta_rpy = 0.0;  // deg-sum (sumAbs)
+    double    vmag         = 0.0;  // cm/s
+    double    delta_rpy    = 0.0;  // deg-sum (sumAbs)
   };
 
   void loadChannelParams(ros::NodeHandle& nhc, Channel& C, const std::string& label){
     C.label = label;
 
-    nhc.param<std::string>("topic",        C.topic,         std::string("/imu_data_" + label));
-    nhc.param<std::string>("out_topic",    C.out_topic_vmag,std::string("/v_mag_" + label));
-    nhc.param<std::string>("out_topic_RPY",C.out_topic_rpy, std::string("/deltaRPY_" + label));
+    nhc.param<std::string>("topic",        C.topic,          std::string("/imu_data_" + label));
+    nhc.param<std::string>("out_topic",    C.out_topic_vmag, std::string("/v_mag_" + label));
+    nhc.param<std::string>("out_topic_RPY",C.out_topic_rpy,  std::string("/deltaRPY_" + label));
 
     nhc.param("deadband_x", C.deadband_x, 0.15);
     nhc.param("deadband_y", C.deadband_y, 0.15);
@@ -192,8 +206,10 @@ private:
 
     nhc.param("rpy_zupt_thresh_deg", C.rpy_zupt_thresh_deg, 5.0);
 
+    // Advertise output topics (use pnh_ so they're global absolute names you pass in)
     C.vmag_pub = pnh_.advertise<std_msgs::Float64>(C.out_topic_vmag, 10);
     C.rpy_pub  = pnh_.advertise<std_msgs::Float64MultiArray>(C.out_topic_rpy, 10);
+
     C.last_msg_time = ros::Time(0);
   }
 
@@ -298,13 +314,13 @@ private:
     double z = a_in;
     if (std::abs(z) < deadband) z = 0.0;
 
-    // 1D KF on accel (optional smoothing)
+    // 1D KF on accel
     S.P_1d += C.Q;
     const double K = S.P_1d / (S.P_1d + C.R);
     S.a_hat += K * (z - S.a_hat);
     S.P_1d  *= (1.0 - K);
 
-    // light LPF accel (used for integration)
+    // LPF accel (used for integration)
     double a_light = a_in;
     if (!S.has_light_prev) {
       S.has_light_prev = true;
@@ -364,15 +380,21 @@ private:
       return;
     }
 
-    const double t_ms = arr[0];
-    const double ax   = arr[1];
-    const double ay   = arr[2];
-    const double az   = arr[3];
+    double t_ms = arr[0];
+    double ax   = arr[1];
+    double ay   = arr[2];
+    double az   = arr[3];
 
-    const float current_angle[3] = {
-      static_cast<float>(arr[4]),
-      static_cast<float>(arr[5]),
-      static_cast<float>(arr[6])
+    finiteOrZero(t_ms);
+    finiteOrZero(ax);
+    finiteOrZero(ay);
+    finiteOrZero(az);
+
+    // IMPORTANT: layout is [roll,pitch,yaw] at indices 4..6
+    const float cur_rpy[3] = {
+      static_cast<float>(arr[4]), // roll_deg
+      static_cast<float>(arr[5]), // pitch_deg
+      static_cast<float>(arr[6])  // yaw_deg
     };
 
     // init on first message
@@ -380,9 +402,9 @@ private:
       C->t_prev_ms = t_ms;
       C->have_prev_time = true;
 
-      C->prev_rpy[0] = current_angle[0];
-      C->prev_rpy[1] = current_angle[1];
-      C->prev_rpy[2] = current_angle[2];
+      C->prev_rpy[0] = cur_rpy[0];
+      C->prev_rpy[1] = cur_rpy[1];
+      C->prev_rpy[2] = cur_rpy[2];
       C->have_prev_rpy = true;
       return;
     }
@@ -405,7 +427,15 @@ private:
     const double F10 = 0.0, F11 =  1.0;
 
     // deltaRPY (deg)
-    DeltaRPY drpy = calcDeltaRPY(current_angle, C->prev_rpy);
+    if (!C->have_prev_rpy) {
+      C->prev_rpy[0] = cur_rpy[0];
+      C->prev_rpy[1] = cur_rpy[1];
+      C->prev_rpy[2] = cur_rpy[2];
+      C->have_prev_rpy = true;
+      return;
+    }
+
+    DeltaRPY drpy = calcDeltaRPY(cur_rpy, C->prev_rpy);
 
     if (drpy.sum <= static_cast<float>(C->rpy_zupt_thresh_deg)) C->rpy_still_count++;
     else C->rpy_still_count = 0;
@@ -436,10 +466,10 @@ private:
     C->rpy_pub.publish(C->rpy_msg);
 
     // cache latest for active selection
-    C->vmag        = v_mag;
-    C->delta_rpy   = drpy.sum;
-    C->latest_stamp= ros::Time::now();
-    C->has_latest  = true;
+    C->vmag         = v_mag;
+    C->delta_rpy    = drpy.sum;
+    C->latest_stamp = ros::Time::now();
+    C->has_latest   = true;
 
     publishActive(dt);
   }
@@ -454,26 +484,25 @@ private:
   // Active-selection state (node-level)
   ros::Publisher active_vmag_pub_;
   std_msgs::Float64 active_vmag_msg_;
-
   double v_active_out_ = 0.0;
 
   // Params (tune in launch)
-  double active_stale_sec_    = 0.20;
-  double move_thresh_deg_     = 1.0;
-  double alpha_up_            = 0.7;
-  double alpha_down_          = 0.05;
-  double max_drop_cms_per_s_  = 200.0;
-  int    fuse_mode_           = 0;
+  double active_stale_sec_   = 0.20;
+  double move_thresh_deg_    = 1.0;
+  double alpha_up_           = 0.7;
+  double alpha_down_         = 0.05;
+  double max_drop_cms_per_s_ = 200.0;
+  int    fuse_mode_          = 0;
 
   ros::Time last_active_pub_time_;
   bool have_active_time_ = false;
 };
 
 int main(int argc, char** argv){
-  ros::init(argc, argv, "velocity_calculator_dual");
+  ros::init(argc, argv, "imu_controller");
   ros::NodeHandle pnh("~");
 
-  VelocityCalculatorDual node(pnh);
+  ImuController node(pnh);
   ros::spin();
   return 0;
 }

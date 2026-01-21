@@ -1,4 +1,4 @@
-// kinco_speed_from_vmag_active.cpp
+// pitch_controller.cpp
 //
 // Subscribes to /v_mag_active (cm/s) and commands Kinco CANopen drives (Profile Velocity mode)
 // to match the speed in real-time.

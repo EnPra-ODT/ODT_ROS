@@ -1,57 +1,68 @@
 #include <ros/ros.h>
 #include <sensor_msgs/Joy.h>
+#include <std_msgs/Float64.h>
 #include <std_msgs/Float64MultiArray.h>
 
-// --- 設定値 ---
-const double MAX_VEL_LIMIT = 255.0;
-const double ANGLE_SENSITIVITY = 1.0; // ループ周期に合わせて調整してください
+// --- Parameters ---
+const double MAX_VEL_LIMIT = 55.0;
+const double YAW_SCALE_DEG = 3.0;   // joystick full-scale → ±30 deg (adjust)
 
-// グローバル変数でジョイスティックの最新の状態を保持
+// Latest joystick values
 double g_axes_1 = 0.0;
 double g_axes_4 = 0.0;
+
 double g_cumulative_angle = 0.0;
 
-// コールバックは値の「更新」だけを行う
-void joyCallback(const sensor_msgs::Joy::ConstPtr& joy) {
-    g_axes_1 = joy->axes[1];
-    g_axes_4 = joy->axes[4];
+// Only update joystick state
+void joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
+{
+    if (joy->axes.size() > 4) {
+        g_axes_1 = joy->axes[1];   // forward
+        g_axes_4 = joy->axes[4];   // yaw
+    }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv){
     ros::init(argc, argv, "joystick_values_node");
     ros::NodeHandle nh;
 
-    ros::Publisher pub = nh.advertise<std_msgs::Float64MultiArray>("joystick_values", 10);
     ros::Subscriber sub = nh.subscribe("joy", 10, joyCallback);
 
-    // 10Hz（0.1秒ごと）でループを実行
-    ros::Rate loop_rate(10); 
+    ros::Publisher vmag_pub = nh.advertise<std_msgs::Float64>("/v_mag_active", 10);
+    ros::Publisher imu_right_pub = nh.advertise<std_msgs::Float64MultiArray>("/imu_data_right", 10);
 
-    ROS_INFO("Joystick Loop Node Started.");
+    ros::Rate loop_rate(10);  // 10 Hz
 
-    while (ros::ok()) {
-        std_msgs::Float64MultiArray msg;
-        msg.data.resize(2);
+    ROS_INFO("Joystick → v_mag_active + imu_data_right started.");
 
-        // --- 左スティック：速度制御 (0-255) ---
-        if (g_axes_1 > 0) {
-            msg.data[0] = g_axes_1 * MAX_VEL_LIMIT;
-        } else {
-            msg.data[0] = 0.0;
-        }
+    while (ros::ok()){
+        // ---- velocity ----
+        std_msgs::Float64 v_msg;
+        if (g_axes_1 > 0.0)
+            v_msg.data = g_axes_1 * MAX_VEL_LIMIT;
+        else
+            v_msg.data = 0.0;
 
-        // --- 右スティック：累積角度制御 ---
-        // ループごとに現在の傾き（g_axes_4）を加算し続ける
-        g_cumulative_angle += g_axes_4 * ANGLE_SENSITIVITY;
-        msg.data[1] = g_cumulative_angle;
+        vmag_pub.publish(v_msg);
 
-        pub.publish(msg);
-
-        // コールバック関数の処理（ジョイスティック入力の更新）を実行
-        ros::spinOnce();
         
-        // 設定した周期（10Hz）になるよう待機
-        loop_rate.sleep(); 
+        std_msgs::Float64MultiArray imu_msg;
+        imu_msg.data.resize(7);
+
+        g_cumulative_angle += g_axes_4 * YAW_SCALE_DEG;
+
+        imu_msg.data[0] = 0.0;                         // t_ms (unused)
+        imu_msg.data[1] = 0.0;                         // ax
+        imu_msg.data[2] = 0.0;                         // ay
+        imu_msg.data[3] = 0.0;                         // az
+        imu_msg.data[4] = g_cumulative_angle;   // yaw (deg) ← IMPORTANT
+        imu_msg.data[5] = 0.0;                         // pitch
+        imu_msg.data[6] = 0.0;                         // roll
+
+        imu_right_pub.publish(imu_msg);
+
+        ros::spinOnce();
+        loop_rate.sleep();
     }
 
     return 0;

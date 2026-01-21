@@ -1,13 +1,16 @@
 <launch>
 
-<!-- ============================================================
-      Dual IMU velocity fusion node
-      - Subscribes:  /imu_data_left, /imu_data_right
-      - Publishes:   /v_mag_left, /v_mag_right, /v_mag_active
+  <!-- ============================================================
+      Dual IMU fused velocity node (NO joystick)
+      Node: imu_controller
+      Sub:  /imu_data_left, /imu_data_right   (Float64MultiArray[7])
+      Pub:  /v_mag_left, /v_mag_right         (Float64)
+            /deltaRPY_left, /deltaRPY_right   (Float64MultiArray[4])
+            /v_mag_active                     (Float64)
       ============================================================ -->
-  <node pkg="odt2025" type="velocity_calculator_dual" name="imu_kf_dual" output="screen">
+  <node pkg="odt2025" type="imu_controller" name="imu_controller" output="screen">
 
-    <!-- Active (fused) output tuning -->
+    <!-- Active-selection params -->
     <param name="active_stale_sec"   value="0.20" />
     <param name="move_thresh_deg"    value="1.0" />
     <param name="alpha_up"           value="0.7" />
@@ -16,7 +19,7 @@
     <!-- 0 = MAX(vL,vR), 1 = deltaRPY-weighted blend -->
     <param name="fuse_mode"          value="0" />
 
-    <!-- LEFT channel params -->
+    <!-- LEFT channel -->
     <group ns="left">
       <param name="topic"            value="/imu_data_left" />
       <param name="out_topic"        value="/v_mag_left" />
@@ -37,7 +40,7 @@
       <param name="rpy_zupt_thresh_deg" value="5.0" />
     </group>
 
-    <!-- RIGHT channel params -->
+    <!-- RIGHT channel -->
     <group ns="right">
       <param name="topic"            value="/imu_data_right" />
       <param name="out_topic"        value="/v_mag_right" />
@@ -63,43 +66,38 @@
 
   <!-- ============================================================
        Kinco CANopen speed node
-       - Subscribes:  /v_mag_active  (cm/s)
-       - Commands:    all node_ids in Profile Velocity mode
-       - Roller dia:  4 cm, gear ratio: 10:1 (motor:roller)
+       Node: pitch_controller (your file is pitch_controller.cpp)
+       Sub:  /v_mag_active (Float64, cm/s)
        ============================================================ -->
-  <node pkg="odt2025" type="kinco_from_vmag_active" name="kinco_speed" output="screen">
-
+  <node pkg="odt2025" type="pitch_controller" name="pitch_controller" output="screen">
     <param name="can_iface"          value="can0" />
     <param name="speed_topic"        value="/v_mag_active" />
 
-    <!-- Motor + mechanism -->
     <param name="roller_diameter_m"  value="0.04" />
     <param name="gear_ratio"         value="10.0" />
     <param name="encoder_res"        value="65536" />
     <param name="max_rpm"            value="5000" />
 
-    <!-- Command behavior -->
     <param name="cmd_refresh_hz"     value="50.0" />
-    <param name="speed_scale"        value="0.01" />   <!-- cm/s -> m/s -->
-    <param name="max_cmd_cms"        value="300.0" />  <!-- safety clamp; set <=0 to disable -->
+    <param name="speed_scale"        value="0.01" />
+    <param name="max_cmd_cms"        value="300.0" />
     <param name="enable_on_start"    value="true" />
 
-    <!-- Optional feedback -->
     <param name="enable_feedback"    value="false" />
     <param name="poll_hz"            value="10.0" />
     <param name="feedback_topic"     value="/kinco/actual_rpm" />
 
-    <!-- Your Kinco node IDs -->
     <rosparam param="node_ids">[1,2,3,4]</rosparam>
   </node>
 
 
-  <!-- Yaw Controller (unchanged) -->
+  <!-- ============================================================
+       Yaw Controller (Dynamixel)
+       Sub:  /imu_data_right, /foot_contact_pair
+       ============================================================ -->
   <node pkg="odt2025" type="yaw_controller" name="yaw_controller" output="screen">
-
     <!-- Topics -->
-    <param name="left_topic" value="/imu_data_left" />
-    <param name="right_topic" value="/imu_data_right" />
+    <param name="right_topic"   value="/imu_data_right" />
     <param name="contact_topic" value="/foot_contact_pair" />
 
     <!-- Dynamixel -->
@@ -107,28 +105,27 @@
     <param name="baud" value="1000000" />
 
     <!-- Control -->
-    <param name="zero_on_start" value="true" />
-    <param name="angle_scale" value="20.0" />
+    <param name="zero_on_start"  value="true" />
+    <param name="angle_scale"    value="20.0" />
     <param name="min_cmd_period" value="0.01" />
 
-    <!-- Per-motor offsets (ID 1~4) -->
-    <param name="goal_offset_ticks_1" value="0" />
-    <param name="goal_offset_ticks_2" value="0" />
-    <param name="goal_offset_ticks_3" value="0" />
-    <param name="goal_offset_ticks_4" value="0" />
+    <!-- If you are using the dynamic-ID version of yaw_controller -->
+    <rosparam param="connected_ids">[1,2,3,4]</rosparam>
+    <!-- Offsets must match number of IDs above (or your code's expected format) -->
+    <rosparam param="goal_offset_ticks">[0]</rosparam>
 
     <!-- Limits -->
-    <param name="use_limits" value="true" />
+    <param name="use_limits"    value="true" />
     <param name="min_goal_tick" value="-1048575" />
     <param name="max_goal_tick" value="1048575" />
   </node>
 
 
-  <!-- Loadcell reader (unchanged) -->
+  <!-- Loadcell reader -->
   <node pkg="odt2025" type="loadcell_node.py" name="loadcell_reader" output="screen">
     <param name="port" value="/dev/ttyACM0" />
-    <param name="baud"  value="115200" />
-    <param name="threshold" value="10.0" />
+    <param name="baud" value="115200" />
+    <param name="threshold" value="15.0" />
   </node>
 
 </launch>
