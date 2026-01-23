@@ -1,5 +1,4 @@
 <launch>
-
   <!-- ============================================================
       Dual IMU fused velocity node (NO joystick)
       Node: imu_controller
@@ -9,7 +8,6 @@
             /v_mag_active                     (Float64)
       ============================================================ -->
   <node pkg="odt2025" type="imu_controller" name="imu_controller" output="screen">
-
     <!-- Active-selection params -->
     <param name="active_stale_sec"   value="0.20" />
     <param name="move_thresh_deg"    value="1.0" />
@@ -60,13 +58,12 @@
       <param name="dt_max" value="0.10" />
       <param name="rpy_zupt_thresh_deg" value="5.0" />
     </group>
-
   </node>
 
 
   <!-- ============================================================
        Kinco CANopen speed node
-       Node: pitch_controller (your file is pitch_controller.cpp)
+       Node: pitch_controller (pitch_controller.cpp)
        Sub:  /v_mag_active (Float64, cm/s)
        ============================================================ -->
   <node pkg="odt2025" type="pitch_controller" name="pitch_controller" output="screen">
@@ -111,8 +108,7 @@
 
     <!-- If you are using the dynamic-ID version of yaw_controller -->
     <rosparam param="connected_ids">[1,2,3,4]</rosparam>
-    <!-- Offsets must match number of IDs above (or your code's expected format) -->
-    <rosparam param="goal_offset_ticks">[0]</rosparam>
+    <rosparam param="goal_offset_ticks">[0,0,0,0]</rosparam>
 
     <!-- Limits -->
     <param name="use_limits"    value="true" />
@@ -126,6 +122,12 @@
     <param name="port" value="/dev/ttyACM0" />
     <param name="baud" value="115200" />
     <param name="threshold" value="15.0" />
+  </node>
+
+  <!-- rosserial socket server (ONLY if you actually need it) -->
+  <node pkg="rosserial_server" type="socket_node" name="rosserial_socket" output="screen">
+    <!-- Set this if your rosserial client connects to TCP, default is 11411 -->
+    <!-- <param name="port" value="11411" /> -->
   </node>
 
 </launch>

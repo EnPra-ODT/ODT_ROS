@@ -1,0 +1,43 @@
+<launch>
+  <node pkg="joy" type="joy_node" name="joy_node" output="screen" />
+
+  <node pkg="odt2025" type="pitch_controller" name="pitch_controller" output="screen">
+    <param name="can_iface"          value="can0" />
+    <param name="speed_topic"        value="/v_mag_active" />
+    <param name="roller_diameter_m"  value="0.04" />
+    <param name="gear_ratio"         value="10.0" />
+    <param name="encoder_res"        value="65536" />
+    <param name="max_rpm"            value="5000" />
+    <param name="cmd_refresh_hz"     value="50.0" />
+    <param name="speed_scale"        value="0.01" />
+    <param name="max_cmd_cms"        value="300.0" />
+    <param name="enable_on_start"    value="true" />
+    <param name="enable_feedback"    value="false" />
+    <param name="poll_hz"            value="10.0" />
+    <param name="feedback_topic"     value="/kinco/actual_rpm" />
+    <rosparam param="node_ids">[1,2,3,4]</rosparam>
+  </node>
+
+  <node pkg="odt2025" type="yaw_controller" name="yaw_controller" output="screen">
+    <param name="right_topic"   value="/imu_data_right" />
+    <param name="contact_topic" value="/foot_contact_pair" />
+    <param name="port" value="/dev/ttyUSB0" />
+    <param name="baud" value="1000000" />
+    <param name="zero_on_start"  value="true" />
+    <param name="angle_scale"    value="20.0" />
+    <param name="min_cmd_period" value="0.01" />
+    <rosparam param="connected_ids">[1,2,3,4]</rosparam>
+    <rosparam param="goal_offset_ticks">[0]</rosparam>
+    <param name="use_limits"    value="true" />
+    <param name="min_goal_tick" value="-1048575" />
+    <param name="max_goal_tick" value="1048575" />
+  </node>
+
+  <node pkg="odt2025" type="loadcell_node.py" name="loadcell_reader" output="screen">
+    <param name="port" value="/dev/ttyACM0" />
+    <param name="baud" value="115200" />
+    <param name="threshold" value="15.0" />
+  </node>
+
+  <node pkg="manual_controller" type="joystick_values_pub" name="joystick_values_pub" output="screen" />
+</launch>

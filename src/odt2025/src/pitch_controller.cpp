@@ -55,263 +55,247 @@ constexpr uint16_t CW_SWITCH_ON        = 0x0007;
 constexpr uint16_t CW_ENABLE_OPERATION = 0x000F;
 // ========================================================
 
-constexpr float MAX_VEL = 50.0f; // max velocity
+constexpr float MAX_VEL = 50.0f; 
 
 
 namespace kinco {
+  struct MotorConfig {
+    int encoder_res = 65536;
+    int max_rpm = 5000;
 
-struct MotorConfig {
-  int encoder_res = 65536;
-  int max_rpm = 5000;
+    double roller_diameter_m = 0.042; //4.2[cm]
+    double gear_ratio = 10.0;
+    double scale_num = 512.0 * 65536.0;
+    double scale_den = 1875.0;
 
-  double roller_diameter_m = 0.042; // 4 cm roller diameter
-  double gear_ratio = 10.0;        // motor:roller = 10:1
+    void normalize() {scale_num = 512.0 * (double)encoder_res;}
+  };
 
-  // Kinco scaling constants (as in your original code)
-  double scale_num = 512.0 * 65536.0; // 512 * encoder_res
-  double scale_den = 1875.0;
+  class CanSocketBus {
+  public:
+    explicit CanSocketBus(const std::string& ifname) { open(ifname); }
+    ~CanSocketBus() { if (sock_ >= 0) ::close(sock_); }
 
-  void normalize() {
-    scale_num = 512.0 * (double)encoder_res;
-  }
-};
+    CanSocketBus(const CanSocketBus&) = delete;
+    CanSocketBus& operator=(const CanSocketBus&) = delete;
 
-class CanSocketBus {
-public:
-  explicit CanSocketBus(const std::string& ifname) { open(ifname); }
-  ~CanSocketBus() { if (sock_ >= 0) ::close(sock_); }
+    void sendFrameDlc(uint32_t can_id, const uint8_t* data, uint8_t dlc) {
+      std::lock_guard<std::mutex> lk(mtx_);
+      struct can_frame frame;
+      std::memset(&frame, 0, sizeof(frame));
+      frame.can_id  = can_id;
+      frame.can_dlc = dlc;
+      if (dlc > 0) std::memcpy(frame.data, data, dlc);
 
-  CanSocketBus(const CanSocketBus&) = delete;
-  CanSocketBus& operator=(const CanSocketBus&) = delete;
-
-  // Generic send with custom DLC
-  void sendFrameDlc(uint32_t can_id, const uint8_t* data, uint8_t dlc) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    struct can_frame frame;
-    std::memset(&frame, 0, sizeof(frame));
-    frame.can_id  = can_id;
-    frame.can_dlc = dlc;
-    if (dlc > 0) std::memcpy(frame.data, data, dlc);
-
-    int n = ::write(sock_, &frame, sizeof(frame));
-    if (n != (int)sizeof(frame)) {
-      std::ostringstream oss;
-      oss << "CAN write failed (n=" << n << " errno=" << errno << ")";
-      throw std::runtime_error(oss.str());
+      int n = ::write(sock_, &frame, sizeof(frame));
+      if (n != (int)sizeof(frame)) {
+        std::ostringstream oss;
+        oss << "CAN write failed (n=" << n << " errno=" << errno << ")";
+        throw std::runtime_error(oss.str());
+      }
     }
-  }
 
-  // SDO always DLC=8
-  void sendFrame8(uint32_t can_id, const uint8_t data[8]) {
-    sendFrameDlc(can_id, data, 8);
-  }
+    void sendFrame8(uint32_t can_id, const uint8_t data[8]) {
+      sendFrameDlc(can_id, data, 8);
+    }
 
-  // NMT: COB-ID 0x000, DLC=2
-  void sendNmt(uint8_t cmd, uint8_t node_id) {
-    uint8_t data[2];
-    data[0] = cmd;     // 0x01=start, 0x02=stop, 0x80=pre-op, 0x81=reset node
-    data[1] = node_id; // 0 = all nodes or specific node
-    sendFrameDlc(0x000, data, 2);
-  }
+    void sendNmt(uint8_t cmd, uint8_t node_id) {              //NMT = control state of node
+      uint8_t data[2];
+      data[0] = cmd;     
+      data[1] = node_id; 
+      sendFrameDlc(0x000, data, 2);
+    }
 
-  bool recvFrame(struct can_frame* out, int timeout_ms) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    fd_set rfds;
-    struct timeval tv;
-    FD_ZERO(&rfds);
-    FD_SET(sock_, &rfds);
+    bool recvFrame(struct can_frame* out, int timeout_ms) {
+      std::lock_guard<std::mutex> lk(mtx_);
+      fd_set rfds;
+      struct timeval tv;
+      FD_ZERO(&rfds);
+      FD_SET(sock_, &rfds);
 
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
+      tv.tv_sec = timeout_ms / 1000;
+      tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-    int ret = ::select(sock_ + 1, &rfds, nullptr, nullptr, &tv);
-    if (ret <= 0) return false;
+      int ret = ::select(sock_ + 1, &rfds, nullptr, nullptr, &tv);
+      if (ret <= 0) return false;
 
-    int n = ::read(sock_, out, sizeof(*out));
-    return n == (int)sizeof(*out);
-  }
+      int n = ::read(sock_, out, sizeof(*out));
+      return n == (int)sizeof(*out);
+    }
 
-private:
-  int sock_ = -1;
-  std::mutex mtx_;
+  private:
+    int sock_ = -1;
+    std::mutex mtx_;
 
-  void open(const std::string& ifname) {
-    struct ifreq ifr;
-    struct sockaddr_can addr;
+    void open(const std::string& ifname) {
+      struct ifreq ifr;
+      struct sockaddr_can addr;
 
-    sock_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (sock_ < 0) throw std::runtime_error("socket(PF_CAN) failed");
+      sock_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
+      if (sock_ < 0) throw std::runtime_error("socket(PF_CAN) failed");
 
-    std::memset(&ifr, 0, sizeof(ifr));
-    std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname.c_str());
-    if (::ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) throw std::runtime_error("ioctl(SIOCGIFINDEX) failed");
+      std::memset(&ifr, 0, sizeof(ifr));
+      std::snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname.c_str());
+      if (::ioctl(sock_, SIOCGIFINDEX, &ifr) < 0) throw std::runtime_error("ioctl(SIOCGIFINDEX) failed");
 
-    std::memset(&addr, 0, sizeof(addr));
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
+      std::memset(&addr, 0, sizeof(addr));
+      addr.can_family = AF_CAN;
+      addr.can_ifindex = ifr.ifr_ifindex;
 
-    if (::bind(sock_, (struct sockaddr*)&addr, sizeof(addr)) < 0) throw std::runtime_error("bind(AF_CAN) failed");
+      if (::bind(sock_, (struct sockaddr*)&addr, sizeof(addr)) < 0) throw std::runtime_error("bind(AF_CAN) failed");
 
-    ROS_INFO("SocketCAN bound to interface: %s", ifname.c_str());
-  }
-};
+      ROS_INFO("SocketCAN bound to interface: %s", ifname.c_str());
+    }
+  };
 
-class SdoClient {
-public:
-  SdoClient(CanSocketBus& bus, int node_id) : bus_(bus), node_id_(node_id) {}
+  class SdoClient {
+  public:
+    SdoClient(CanSocketBus& bus, int node_id) : bus_(bus), node_id_(node_id) {}
 
-  void writeU16(uint16_t index, uint8_t sub, uint16_t val) {
-    uint8_t b[2];
-    b[0] = (uint8_t)(val & 0xFF);
-    b[1] = (uint8_t)((val >> 8) & 0xFF);
-    sendSdo(0x2B, index, sub, b, 2);
-  }
+    void writeU16(uint16_t index, uint8_t sub, uint16_t val) {
+      uint8_t b[2];
+      b[0] = (uint8_t)(val & 0xFF);
+      b[1] = (uint8_t)((val >> 8) & 0xFF);
+      sendSdo(0x2B, index, sub, b, 2);
+    }
 
-  void writeI8(uint16_t index, uint8_t sub, int8_t val) {
-    uint8_t b[1];
-    b[0] = (uint8_t)val;
-    sendSdo(0x2F, index, sub, b, 1);
-  }
+    void writeI8(uint16_t index, uint8_t sub, int8_t val) {
+      uint8_t b[1];
+      b[0] = (uint8_t)val;
+      sendSdo(0x2F, index, sub, b, 1);
+    }
 
-  void writeI32(uint16_t index, uint8_t sub, int32_t val) {
-    uint8_t b[4];
-    b[0] = (uint8_t)(val & 0xFF);
-    b[1] = (uint8_t)((val >> 8) & 0xFF);
-    b[2] = (uint8_t)((val >> 16) & 0xFF);
-    b[3] = (uint8_t)((val >> 24) & 0xFF);
-    sendSdo(0x23, index, sub, b, 4);
-  }
+    void writeI32(uint16_t index, uint8_t sub, int32_t val) {
+      uint8_t b[4];
+      b[0] = (uint8_t)(val & 0xFF);
+      b[1] = (uint8_t)((val >> 8) & 0xFF);
+      b[2] = (uint8_t)((val >> 16) & 0xFF);
+      b[3] = (uint8_t)((val >> 24) & 0xFF);
+      sendSdo(0x23, index, sub, b, 4);
+    }
 
-  bool readI32(uint16_t index, uint8_t sub, int32_t* out_val, int window_ms) {
-    const uint32_t req_cob = 0x600 + (uint32_t)node_id_;
-    const uint32_t rep_cob = 0x580 + (uint32_t)node_id_;
+    bool readI32(uint16_t index, uint8_t sub, int32_t* out_val, int window_ms) {
+      const uint32_t req_cob = 0x600 + (uint32_t)node_id_;
+      const uint32_t rep_cob = 0x580 + (uint32_t)node_id_;
 
-    uint8_t req[8];
-    std::memset(req, 0, sizeof(req));
-    req[0] = 0x40;
-    req[1] = (uint8_t)(index & 0xFF);
-    req[2] = (uint8_t)((index >> 8) & 0xFF);
-    req[3] = sub;
-    bus_.sendFrame8(req_cob, req);
+      uint8_t req[8];
+      std::memset(req, 0, sizeof(req));
+      req[0] = 0x40;
+      req[1] = (uint8_t)(index & 0xFF);
+      req[2] = (uint8_t)((index >> 8) & 0xFF);
+      req[3] = sub;
+      bus_.sendFrame8(req_cob, req);
 
-    const ros::Time end = ros::Time::now() + ros::Duration(window_ms / 1000.0);
-    while (ros::Time::now() < end && ros::ok()) {
-      struct can_frame f;
-      if (!bus_.recvFrame(&f, 5)) continue;
+      const ros::Time end = ros::Time::now() + ros::Duration(window_ms / 1000.0);
+      while (ros::Time::now() < end && ros::ok()) {
+        struct can_frame f;
+        if (!bus_.recvFrame(&f, 5)) continue;
 
-      if ((f.can_id & CAN_EFF_MASK) != rep_cob) continue;
-      if (f.can_dlc < 8) continue;
-      if (f.data[1] != (uint8_t)(index & 0xFF)) continue;
-      if (f.data[2] != (uint8_t)((index >> 8) & 0xFF)) continue;
-      if (f.data[3] != sub) continue;
+        if ((f.can_id & CAN_EFF_MASK) != rep_cob) continue;
+        if (f.can_dlc < 8) continue;
+        if (f.data[1] != (uint8_t)(index & 0xFF)) continue;
+        if (f.data[2] != (uint8_t)((index >> 8) & 0xFF)) continue;
+        if (f.data[3] != sub) continue;
 
-      int32_t v = 0;
-      v |= ((int32_t)f.data[4]) << 0;
-      v |= ((int32_t)f.data[5]) << 8;
-      v |= ((int32_t)f.data[6]) << 16;
-      v |= ((int32_t)f.data[7]) << 24;
-      *out_val = v;
+        int32_t v = 0;
+        v |= ((int32_t)f.data[4]) << 0;
+        v |= ((int32_t)f.data[5]) << 8;
+        v |= ((int32_t)f.data[6]) << 16;
+        v |= ((int32_t)f.data[7]) << 24;
+        *out_val = v;
+        return true;
+      }
+      return false;
+    }
+
+    int nodeId() const { return node_id_; }
+
+  private:
+    CanSocketBus& bus_;
+    int node_id_;
+
+    void sendSdo(uint8_t cs, uint16_t index, uint8_t sub, const uint8_t* data_bytes, int data_len) {
+      const uint32_t cob_id = 0x600 + (uint32_t)node_id_;
+      uint8_t data[8];
+      std::memset(data, 0, sizeof(data));
+      data[0] = cs;
+      data[1] = (uint8_t)(index & 0xFF);
+      data[2] = (uint8_t)((index >> 8) & 0xFF);
+      data[3] = sub;
+      for (int i = 0; i < data_len && i < 4; i++) data[4 + i] = data_bytes[i];
+      bus_.sendFrame8(cob_id, data);
+    }
+  };
+
+  class KincoMotor {
+  public:
+    double linearMsToMotorRpm(double roller_v_ms) const { return msToMotorRpm(roller_v_ms); }
+    int32_t motorRpmToDriveUnits(double motor_rpm) const { return rpmToDriveUnits(motor_rpm); }
+
+    KincoMotor(CanSocketBus& bus, int node_id, const MotorConfig& cfg) : cfg_(cfg), sdo_(bus, node_id){
+      cfg_.normalize();
+    }
+
+    int nodeId() const { return sdo_.nodeId(); }
+
+    void initProfileVelocityMode() {
+      sdo_.writeU16(0x6040, 0x00, CW_SHUTDOWN);
+      ros::Duration(0.05).sleep();
+
+      sdo_.writeI8(0x6060, 0x00, 3);      //Profile Velcotiy = 3
+      ros::Duration(0.05).sleep();
+
+      sdo_.writeI32(0x60FF, 0x00, 0);     //Target Velocity = 0
+      ros::Duration(0.05).sleep();
+
+      sdo_.writeU16(0x6040, 0x00, CW_SWITCH_ON);
+      ros::Duration(0.05).sleep();
+
+      sdo_.writeU16(0x6040, 0x00, CW_ENABLE_OPERATION);
+      ros::Duration(0.05).sleep();
+
+      ROS_INFO("Node %d: Profile Velocity enabled (6060=3).", nodeId());
+    }
+
+    void setTargetLinearMs(double roller_v_ms) { setTargetRpm(msToMotorRpm(roller_v_ms)); }
+
+    bool readActualRpm(double* out_motor_rpm, int window_ms = 20) {
+      int32_t dec_val = 0;
+      if (!sdo_.readI32(0x606C, 0x00, &dec_val, window_ms)) return false;
+      *out_motor_rpm = driveUnitsToRpm(dec_val);
       return true;
     }
-    return false;
-  }
 
-  int nodeId() const { return node_id_; }
+  private:
+    mutable MotorConfig cfg_;
+    SdoClient sdo_;
 
-private:
-  CanSocketBus& bus_;
-  int node_id_;
+    void setTargetRpm(double motor_rpm) {
+      if (!std::isfinite(motor_rpm)) motor_rpm = 0.0;
+      motor_rpm = std::max(-(double)cfg_.max_rpm, std::min((double)cfg_.max_rpm, motor_rpm));
+      const int32_t dec = rpmToDriveUnits(motor_rpm);
+      sdo_.writeI32(0x60FF, 0x00, dec);
+    }
 
-  void sendSdo(uint8_t cs, uint16_t index, uint8_t sub, const uint8_t* data_bytes, int data_len) {
-    const uint32_t cob_id = 0x600 + (uint32_t)node_id_;
-    uint8_t data[8];
-    std::memset(data, 0, sizeof(data));
-    data[0] = cs;
-    data[1] = (uint8_t)(index & 0xFF);
-    data[2] = (uint8_t)((index >> 8) & 0xFF);
-    data[3] = sub;
-    for (int i = 0; i < data_len && i < 4; i++) data[4 + i] = data_bytes[i];
-    bus_.sendFrame8(cob_id, data);
-  }
-};
+    double msToMotorRpm(double roller_v_ms) const {
+      const double circ = M_PI * cfg_.roller_diameter_m;
+      if (circ <= 0.0) return 0.0;
+      const double roller_rpm = (roller_v_ms / circ) * 60.0;
+      return roller_rpm * cfg_.gear_ratio;
+    }
 
-class KincoMotor {
-public:
-  // For logging
-  double linearMsToMotorRpm(double roller_v_ms) const { return msToMotorRpm(roller_v_ms); }
-  int32_t motorRpmToDriveUnits(double motor_rpm) const { return rpmToDriveUnits(motor_rpm); }
+    int32_t rpmToDriveUnits(double motor_rpm) const {
+      const double dec_f = motor_rpm * cfg_.scale_num / cfg_.scale_den;
+      return (int32_t)llround(dec_f);
+    }
 
-  KincoMotor(CanSocketBus& bus, int node_id, const MotorConfig& cfg)
-    : cfg_(cfg), sdo_(bus, node_id)
-  {
-    cfg_.normalize();
-  }
+    double driveUnitsToRpm(int32_t dec) const {
+      return (double)dec * cfg_.scale_den / cfg_.scale_num;
+    }
+  };
 
-  int nodeId() const { return sdo_.nodeId(); }
+}
 
-  void initProfileVelocityMode() {
-    // Shutdown first
-    sdo_.writeU16(0x6040, 0x00, CW_SHUTDOWN);
-    ros::Duration(0.05).sleep();
-
-    // Set mode (Profile Velocity = 3)
-    sdo_.writeI8(0x6060, 0x00, 3);
-    ros::Duration(0.05).sleep();
-
-    // Target velocity = 0
-    sdo_.writeI32(0x60FF, 0x00, 0);
-    ros::Duration(0.05).sleep();
-
-    // Switch on + enable op
-    sdo_.writeU16(0x6040, 0x00, CW_SWITCH_ON);
-    ros::Duration(0.05).sleep();
-
-    sdo_.writeU16(0x6040, 0x00, CW_ENABLE_OPERATION);
-    ros::Duration(0.05).sleep();
-
-    ROS_INFO("Node %d: Profile Velocity enabled (6060=3).", nodeId());
-  }
-
-  void setTargetLinearMs(double roller_v_ms) { setTargetRpm(msToMotorRpm(roller_v_ms)); }
-
-  bool readActualRpm(double* out_motor_rpm, int window_ms = 20) {
-    int32_t dec_val = 0;
-    if (!sdo_.readI32(0x606C, 0x00, &dec_val, window_ms)) return false;
-    *out_motor_rpm = driveUnitsToRpm(dec_val);
-    return true;
-  }
-
-private:
-  mutable MotorConfig cfg_;
-  SdoClient sdo_;
-
-  void setTargetRpm(double motor_rpm) {
-    if (!std::isfinite(motor_rpm)) motor_rpm = 0.0;
-    motor_rpm = std::max(-(double)cfg_.max_rpm, std::min((double)cfg_.max_rpm, motor_rpm));
-    const int32_t dec = rpmToDriveUnits(motor_rpm);
-    sdo_.writeI32(0x60FF, 0x00, dec);
-  }
-
-  double msToMotorRpm(double roller_v_ms) const {
-    const double circ = M_PI * cfg_.roller_diameter_m;
-    if (circ <= 0.0) return 0.0;
-    const double roller_rpm = (roller_v_ms / circ) * 60.0;
-    return roller_rpm * cfg_.gear_ratio; // <-- your multiply-by-10
-  }
-
-  int32_t rpmToDriveUnits(double motor_rpm) const {
-    const double dec_f = motor_rpm * cfg_.scale_num / cfg_.scale_den;
-    return (int32_t)llround(dec_f);
-  }
-
-  double driveUnitsToRpm(int32_t dec) const {
-    return (double)dec * cfg_.scale_den / cfg_.scale_num;
-  }
-};
-
-} // namespace kinco
-
-// ----------------- ROS helpers -----------------
 static std::vector<int> getNodeIdsParam(ros::NodeHandle& pnh) {
   std::vector<int> ids;
   XmlRpc::XmlRpcValue v;
@@ -330,6 +314,7 @@ static std::vector<int> getNodeIdsParam(ros::NodeHandle& pnh) {
   if (ids.empty()) ids.push_back(1);
   return ids;
 }
+
 
 static double clampNonNegFinite(double x, double max_val, bool enable_max) {
   if (!std::isfinite(x)) return 0.0;
@@ -379,18 +364,13 @@ int main(int argc, char** argv) {
     cfg.normalize();
 
     const auto node_ids = getNodeIdsParam(pnh);
-
-    // ----- CAN bus -----
     kinco::CanSocketBus bus(can_iface);
-
-    // Put all nodes into OPERATIONAL
     for (int id : node_ids) {
       bus.sendNmt(0x01, (uint8_t)id);
       ros::Duration(0.01).sleep();
     }
     ros::Duration(0.05).sleep();
 
-    // ----- Motors -----
     std::vector<std::unique_ptr<kinco::KincoMotor>> motors;
     motors.reserve(node_ids.size());
     for (int id : node_ids) motors.emplace_back(std::make_unique<kinco::KincoMotor>(bus, id, cfg));
@@ -402,7 +382,6 @@ int main(int argc, char** argv) {
       }
     }
 
-    // ----- Speed input -----
     std::mutex cmd_mtx;
     double latest_v_cms = 0.0;
     bool have_cmd = false;
@@ -410,14 +389,14 @@ int main(int argc, char** argv) {
     ros::Subscriber sub_speed = nh.subscribe<std_msgs::Float64>(
       speed_topic, 50,
       [&](const std_msgs::Float64::ConstPtr& msg){
-        float data = static_cast<float>(msg->data);
+        float data = (static_cast<float>(msg->data))/3;
 
         if (!std::isfinite(data)) data = 0.0f;
-        if (data < 0.0f) data = 0.0f;          // optional but recommended
-        if (data > MAX_VEL) data = MAX_VEL;    // your clamp
+        if (data < 0.0f) data = 0.0f;         
+        if (data > MAX_VEL) data = MAX_VEL;
 
         std::lock_guard<std::mutex> lk(cmd_mtx);
-        latest_v_cms = static_cast<double>(data);
+        latest_v_cms = (static_cast<double>(data));
         have_cmd = true;
       }
     );

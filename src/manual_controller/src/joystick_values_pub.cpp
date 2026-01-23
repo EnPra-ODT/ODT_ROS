@@ -4,8 +4,8 @@
 #include <std_msgs/Float64MultiArray.h>
 
 // --- Parameters ---
-const double MAX_VEL_LIMIT = 55.0;
-const double YAW_SCALE_DEG = 3.0;   // joystick full-scale → ±30 deg (adjust)
+const double MAX_VEL_LIMIT = 180.0;
+const double YAW_SCALE_DEG = 2.0;   // joystick full-scale → ±30 deg (adjust)
 
 // Latest joystick values
 double g_axes_1 = 0.0;

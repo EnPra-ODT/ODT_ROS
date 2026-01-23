@@ -44,6 +44,9 @@
 #include <string>
 #include <algorithm>
 
+#include <fstream>
+#include <iomanip>
+
 // ----------------- Per-axis state -----------------
 struct AxisState {
   double a_hat = 0.0;
@@ -58,6 +61,13 @@ struct AxisState {
   double P00 = 1.0, P01 = 0.0, P10 = 0.0, P11 = 1.0;
 };
 
+struct DeltaRPY {
+  float dR  = 0.f;
+  float dP  = 0.f;
+  float dY  = 0.f;
+  float sum = 0.f;
+};
+
 // ----------------- Helpers -----------------
 static inline float wrapDiffDeg(float cur, float prev){
   float d = cur - prev;
@@ -65,13 +75,6 @@ static inline float wrapDiffDeg(float cur, float prev){
   while (d < -180.0f) d += 360.0f;
   return d;
 }
-
-struct DeltaRPY {
-  float dR  = 0.f;
-  float dP  = 0.f;
-  float dY  = 0.f;
-  float sum = 0.f;
-};
 
 static inline DeltaRPY calcDeltaRPY(const float cur[3], float prev[3]){
   DeltaRPY out;
@@ -104,10 +107,10 @@ public:
     // Active-selection params (node-level)
     pnh_.param("active_stale_sec",   active_stale_sec_,   0.20);
     pnh_.param("move_thresh_deg",    move_thresh_deg_,    1.0);
-    pnh_.param("alpha_up",           alpha_up_,           0.7);
-    pnh_.param("alpha_down",         alpha_down_,         0.05);
+    pnh_.param("alpha_up",           alpha_up_,           0.3);
+    pnh_.param("alpha_down",         alpha_down_,         0.02);
+    pnh_.param("fuse_mode",          fuse_mode_,          1);
     pnh_.param("max_drop_cms_per_s", max_drop_cms_per_s_, 200.0);
-    pnh_.param("fuse_mode",          fuse_mode_,          0);
 
     std::string active_out_topic;
     pnh_.param<std::string>("active_out_topic", active_out_topic, std::string("/v_mag_active"));
@@ -159,22 +162,18 @@ private:
     double r_zupt = 1e-4;
 
     double dt_min = 0.001;
-    double dt_max = 0.10;
+    double dt_max = 0.15;
     double rpy_zupt_thresh_deg = 5.0;
 
-    // Time tracking
     bool   have_prev_time = false;
     double t_prev_ms = 0.0;
 
-    // RPY tracking
     bool  have_prev_rpy = false;
     float prev_rpy[3] = {0.f, 0.f, 0.f};
     int   rpy_still_count = 0;
 
-    // Axis states
     AxisState x, y, z;
 
-    // Cached outputs (for active selection)
     bool      has_latest   = false;
     ros::Time latest_stamp;
     double    vmag         = 0.0;  // cm/s
@@ -202,7 +201,7 @@ private:
     nhc.param("r_zupt", C.r_zupt, 1e-4);
 
     nhc.param("dt_min", C.dt_min, 0.001);
-    nhc.param("dt_max", C.dt_max, 0.10);
+    nhc.param("dt_max", C.dt_max, 0.15);
 
     nhc.param("rpy_zupt_thresh_deg", C.rpy_zupt_thresh_deg, 5.0);
 
@@ -227,6 +226,33 @@ private:
       ROS_WARN_THROTTLE(2.0, "[%s] No IMU messages received in >2s.", C.label.c_str());
     }
   }
+
+  void logActiveVelocityCSV(double v_mag_active){
+    static const std::string csv_filename = "/tmp/v_mag_active_" + std::to_string(ros::Time::now().toSec()) + ".csv";
+
+    static std::ofstream ofs;
+    static bool initialized = false;
+
+    if (!initialized) {
+      ofs.open(csv_filename, std::ios::out | std::ios::app);
+      if (!ofs.is_open()) {
+        ROS_ERROR_THROTTLE(2.0, "Failed to open CSV file: %s", csv_filename.c_str());
+        return;
+      } 
+
+      // Write header if file is empty
+      ofs << "ros_time_sec,v_mag_active_cm_s\n";
+      ofs.flush();
+      initialized = true;
+
+      ROS_INFO_STREAM("[imu_controller] Logging v_mag_active to " << csv_filename);
+    }
+
+    const double t = ros::Time::now().toSec();
+    ofs << std::fixed << std::setprecision(6)
+        << t << "," << v_mag_active << "\n";
+    }
+
 
   // ---------- Active selection ----------
   void publishActive(double dt_fallback){
@@ -275,9 +301,27 @@ private:
       if (fuse_mode_ == 0) {
         v_meas = std::max(vL, vR);
       } else {
-        const double wL_raw = std::max(0.0, dL - move_thresh_deg_);
-        const double wR_raw = std::max(0.0, dR - move_thresh_deg_);
+        // const double wL_raw = std::max(0.0, dL - move_thresh_deg_);
+        // const double wR_raw = std::max(0.0, dR - move_thresh_deg_);
+        // const double sum = wL_raw + wR_raw + 1e-9;
+        // const double wL = wL_raw / sum;
+
+        // v_meas = wL * vL + (1.0 - wL) * vR;
+        const double w_range_deg = 12.0;  
+        auto soft01 = [&](double d_sum){
+          double x = (d_sum - move_thresh_deg_) / w_range_deg;
+          if (x < 0.0) x = 0.0;
+          if (x > 1.0) x = 1.0;
+          return x * x * (3.0 - 2.0 * x);
+        };
+
+        // const double wL_raw = soft01(dL);
+        // const double wR_raw = soft01(dR);
+        const double wL_raw = soft01(dL) * std::max(0.0, vL);
+        const double wR_raw = soft01(dR) * std::max(0.0, vR);
+
         const double sum = wL_raw + wR_raw + 1e-9;
+
         const double wL = wL_raw / sum;
         v_meas = wL * vL + (1.0 - wL) * vR;
       }
@@ -298,6 +342,7 @@ private:
     v_active_out_ = v_next;
     active_vmag_msg_.data = v_active_out_;
     active_vmag_pub_.publish(active_vmag_msg_);
+    logActiveVelocityCSV(v_active_out_);
   }
 
   // ---------- Filter axis ----------
@@ -489,10 +534,10 @@ private:
   // Params (tune in launch)
   double active_stale_sec_   = 0.20;
   double move_thresh_deg_    = 1.0;
-  double alpha_up_           = 0.7;
-  double alpha_down_         = 0.05;
+  double alpha_up_           = 0.2;
+  double alpha_down_         = 0.02;
   double max_drop_cms_per_s_ = 200.0;
-  int    fuse_mode_          = 0;
+  int    fuse_mode_          = 1;
 
   ros::Time last_active_pub_time_;
   bool have_active_time_ = false;
